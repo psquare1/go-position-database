@@ -1,0 +1,17 @@
+tags:
+  joseki:
+    parents: []
+  corner-joseki:
+    parents:
+      - joseki
+  3-3-joseki:
+    parents:
+      - corner-joseki
+  sente:
+    parents: []
+  reverse-sente:
+    parents:
+      - sente
+  large-reverse-sente:
+    parents:
+      - reverse-sente

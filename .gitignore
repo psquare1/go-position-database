@@ -1,0 +1,8 @@
+generated/
+positions/
+config.yaml
+tags.yaml
+__pycache__/
+*.pyc
+.venv/
+venv/
