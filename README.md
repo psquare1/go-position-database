@@ -1,12 +1,14 @@
 # Go Position DB
 
-Go Position DB is a desktop library for collecting, annotating, organizing, and
-searching Go positions. It is designed for the moment when screenshots, SGFs,
-variations, and study notes have outgrown a loose collection of files.
+Go Position Database is a desktop library for collecting, annotating, organizing, 
+and searching Go positions. Its flexible tagging and Boolean search make it easy 
+to rediscover a specific position from only a vague memory, compare recurring 
+shapes across different games, and recognize patterns in how similar positions are 
+played.
 
 The PySide6 app is the primary interface. It provides a visual browser for the
 collection, a board-focused editor for individual positions, and a tag manager
-for building a reusable study vocabulary.
+for classifying positions using a customizable vocabulary.
 
 ## What you can do
 
@@ -20,11 +22,10 @@ for building a reusable study vocabulary.
   `joseki` without storing both tags on the position.
 - Search with Boolean expressions such as `joseki AND NOT ko`, including `AND`,
   `OR`, `NOT`, parentheses, and autocomplete.
-- Browse visually in Compact, Standard, or Detailed mode.
 - Paste images directly from the clipboard when capturing a position is faster
   than saving it first.
 - Keep the complete collection in ordinary folders that are easy to inspect,
-  copy, synchronize, or back up with Git.
+  manually open SGFs with, copy, synchronize, or back up with Git.
 
 ## Quick start on Windows
 
@@ -132,16 +133,15 @@ leading. Press **Enter** to normalize the value and turn the score field into a
 chip. In score chips, the background matches the leading player—black for Black,
 white for White—while blue text keeps the value distinct.
 
-The editor displays one large image at a time. Use the subtle left and right
+The editor displays one large image at a time. Use the left and right
 arrows to move between the main image and its solution images. The visible
 description and score always belong to the currently displayed image.
 
 Changes save automatically after a short pause. They are also flushed when you
-return to Browse or close the app. If you create a position accidentally and
-leave it completely empty, the unused draft is removed automatically. Deleting
+return to Browse or close the app. Deleting
 a populated position always requires confirmation.
 
-### Build a tag system
+### Tag system
 
 Choose **Manage tags** to create and maintain the vocabulary used to organize the
 collection.
@@ -149,7 +149,7 @@ collection.
 - Type a new tag name and press **Enter** to create and select it.
 - Type an existing name and press **Enter** to select it.
 - Press **Tab** to accept autocomplete.
-- Add a description explaining how the tag should be used; descriptions save
+- Optionally, add a description explaining how the tag should be used; descriptions save
   automatically.
 - Add or remove parents and children. Editing either side keeps the reverse
   relationship synchronized.
@@ -319,26 +319,19 @@ files:
   image_extensions: [.png, .jpg, .jpeg, .webp, .bmp, .gif]
 ```
 
-## Development and tests
-
-Install the GUI requirements, then run:
-
-```powershell
-python -m unittest discover -s tests -v
-```
-
-The tests cover Boolean and inherited search, score and solution-image schema,
-tag normalization and hierarchy safety, file cleanup, startup maintenance,
-automatic saving behavior, and important GUI layout interactions.
-
 ## Transparency and limitations
 
-This project was mainly **vibe-coded with AI assistance**. It has an automated
-test suite and has been iterated against real usage, but it should still be
-treated as a personal tool rather than audited production software. Back up an
+This project was heavily **vibe-coded with AI assistance**. Back up an
 important collection before large imports or bulk file operations.
 
-- SGFs are stored and managed, but the app does not render them as interactive boards.
-- The app does not perform Go analysis or calculate scores.
-- Score and solution-image editing currently belongs to the PySide6 interface,
-  not dedicated CLI commands.
+## Future Updates
+
+Some things this project wants to add include
+
+- Preset list of common tags, might publish my own position collection
+- Possibility to publish, share, or merge positions with others
+- Customizable color scheme/layout. Greater compatibility with different screen sizes.
+- Native interactable SGF board, instead of relying on images
+- Integrate with KataGo somehow
+
+Any pull requests implementing these would be extremely welcome.
