@@ -14,9 +14,12 @@ for classifying positions using a customizable vocabulary.
 
 - Build a personal database of Go positions from screenshots or other board images.
 - Keep an optional SGF with each position.
+- Open attached SGFs as native, scalable Go boards, step through moves, explore
+  variations, and add standard point annotations directly on the board.
 - Add a description, score, structured metadata, and any number of explicit tags.
-- Attach multiple solution images to explain variations or alternative lines.
-  Every solution image can have its own description and score.
+- Attach multiple solution images or SGF-backed board instances to explain
+  variations and alternative lines. Every solution can have its own description
+  and score.
 - Organize tags into parent/child hierarchies. A position tagged
   `3-3-joseki`, for example, can also appear in a search for its parent tag
   `joseki` without storing both tags on the position.
@@ -110,7 +113,11 @@ Choose a result layout according to how much context you need:
 - **Standard** shows images, filenames, and tags, three per row.
 - **Detailed** adds the score, description, and metadata.
 
-Click an image, or double-click its result, to open the full position editor.
+When a position has an attached SGF, its result shows a small read-only board
+rendered at the stored start node instead of the main image.
+
+Click a result's board or image, or double-click the result, to open the full
+position editor.
 
 ### Create and edit positions
 
@@ -119,12 +126,14 @@ rest of the collection. You can then:
 
 - choose, replace, or paste the main board image;
 - attach, replace, or remove an SGF;
+- view an attached SGF directly on the large board surface, move through its
+  game tree, and inspect its labels and shape annotations;
 - write a description;
 - add tags;
 - record metadata as descriptor/value pairs, such as source, game, move, player,
   difficulty, or review status;
 - enter a score for the current image;
-- add, paste, replace, and remove solution images; and
+- add, paste, replace, and remove solution images or board instances; and
 - open the position folder when direct file access is useful.
 
 Scores accept normal Go notation, such as `B +3.5` and `W +6.5`. A raw positive
@@ -133,9 +142,29 @@ leading. Press **Enter** to normalize the value and turn the score field into a
 chip. In score chips, the background matches the leading player—black for Black,
 white for White—while blue text keeps the value distinct.
 
-The editor displays one large image at a time. Use the left and right
-arrows to move between the main image and its solution images. The visible
-description and score always belong to the currently displayed image.
+The editor displays one large image at a time. Use the left and right arrows to
+move between the main image and its solution images. The visible description and
+score always belong to the currently displayed image.
+
+When the main position has an SGF, the editor uses that same large display area
+for a native Go board instead of the static main image. The upper square contains
+only the board or image; a divided rectangular toolbar sits below it. Use `<` and
+`>` for single moves, the adjacent ten-move buttons for larger jumps, and `<<`
+or `>>` for the ends of the selected line. Left/Right, Page Up/Page Down, Home,
+and End provide the same keyboard navigation. The **V ↑** and **V ↓** buttons—or
+the Up/Down keys—cycle through alternative branches. To annotate the current
+SGF node, select `123`, triangle, circle, square, or cross, then click an
+intersection. Clicking an existing annotation with its matching tool removes it.
+Number labels are assigned in order, while selecting a different markup for the
+same point replaces the old one. These changes use the editor's normal autosave.
+Board coordinates appear along the top and left edges. Setup stones, passes, and
+captures are replayed. **Refresh** returns to the SGF node stored for the current
+item. Click **Set** to replace that stored node with the one currently visible.
+
+The Solutions menu can add ordinary images or an **Add board** instance. A board
+instance begins at the SGF root and behaves like an independent solution view.
+Navigate to the desired node and click **Set** to store its opening point. Solution
+images and boards remain available through the outer carousel.
 
 Changes save automatically after a short pause. They are also flushed when you
 return to Browse or close the app. Deleting
@@ -184,6 +213,7 @@ A typical position record looks like this:
 ```yaml
 description: White can take reverse sente before tenuki.
 score: B +3.5
+sgf_start_path: [0, 1]
 tags:
   - 3-3-joseki
   - reverse-sente
@@ -193,9 +223,20 @@ metadata:
   move: 38
 solution_images:
   - file: solutions/solution-001.png
+    kind: image
     description: White resists immediately.
     score: W +1.5
+    sgf_start_path: [0, 1, 2]
+  - file: ''
+    kind: board
+    description: Quiet continuation shown on the native board.
+    score: B +0.5
+    sgf_start_path: [0, 2]
 ```
+
+An `sgf_start_path` identifies a node by listing the child index taken at each
+branch from the SGF root. An empty list means the root node. Paths remain
+unambiguous even when separate variations contain the same move number.
 
 The app maintains its search index automatically. On startup it also checks the
 collection and normalizes unambiguous image and SGF filenames. The generated
@@ -324,6 +365,9 @@ files:
 This project was heavily **vibe-coded with AI assistance**. Back up an
 important collection before large imports or bulk file operations.
 
+The native SGF board can edit numbered labels, triangles, circles, squares, and
+crosses. Moves and the structure of the game tree are still read-only.
+
 ## Future Updates
 
 Some things this project wants to add include
@@ -331,7 +375,7 @@ Some things this project wants to add include
 - Preset list of common tags, might publish my own position collection
 - Possibility to publish, share, or merge positions with others
 - Customizable color scheme/layout. Greater compatibility with different screen sizes.
-- Native interactable SGF board, instead of relying on images
-- Integrate with KataGo somehow
+- Expand the native SGF board with move and game-tree editing
+- Integrate the native board with KataGo analysis
 
 Any pull requests implementing these would be extremely welcome.

@@ -178,6 +178,18 @@ def formatted_score(value: Any) -> str | None:
     return f"{player} +{numeric.group(2)}"
 
 
+def normalized_sgf_start_path(value: Any, label: str = "SGF start path") -> list[int]:
+    """Validate a stable SGF node path expressed as child indexes from the root."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+        isinstance(index, int) and not isinstance(index, bool) and index >= 0
+        for index in value
+    ):
+        raise DatabaseError(f"{label} must be a list of non-negative child indexes.")
+    return list(value)
+
+
 def normalize_position_record(value: Any) -> dict[str, Any]:
     if value is None:
         value = {}
@@ -188,6 +200,7 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
     result.pop("name", None)
     result.setdefault("description", "")
     result.setdefault("score", "")
+    result.setdefault("sgf_start_path", [])
     result.setdefault("tags", [])
     result.setdefault("metadata", {})
     result.setdefault("solution_images", [])
@@ -198,6 +211,9 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
         result["score"] = normalized_score
     elif not isinstance(result["score"], str):
         raise DatabaseError("Position 'score' must be a score string or a positive/negative number.")
+    result["sgf_start_path"] = normalized_sgf_start_path(
+        result["sgf_start_path"], "Position 'sgf_start_path'"
+    )
     if not isinstance(result["tags"], list) or not all(isinstance(x, str) for x in result["tags"]):
         raise DatabaseError("Position 'tags' must be a list of strings.")
     # Import lazily to keep storage and tag-graph module initialization independent.
@@ -207,17 +223,25 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
         raise DatabaseError("Position 'metadata' must be a mapping.")
     if not isinstance(result["solution_images"], list):
         raise DatabaseError("Position 'solution_images' must be a list.")
-    normalized_solutions: list[dict[str, str]] = []
+    normalized_solutions: list[dict[str, Any]] = []
     for index, item in enumerate(result["solution_images"], start=1):
         if not isinstance(item, dict):
             raise DatabaseError(f"Solution image {index} must be a mapping.")
+        kind = item.get("kind", "image")
         file_value = item.get("file", "")
         description = item.get("description", "")
         score = item.get("score", "")
-        if not isinstance(file_value, str) or not file_value.strip():
+        sgf_start_path = normalized_sgf_start_path(
+            item.get("sgf_start_path", []), f"Solution image {index} 'sgf_start_path'"
+        )
+        if kind not in {"image", "board"}:
+            raise DatabaseError(f"Solution {index} kind must be 'image' or 'board'.")
+        if not isinstance(file_value, str):
+            raise DatabaseError(f"Solution {index} file path must be a string.")
+        if kind == "image" and not file_value.strip():
             raise DatabaseError(f"Solution image {index} needs a file path.")
-        relative = Path(file_value)
-        if relative.is_absolute() or ".." in relative.parts:
+        relative = Path(file_value) if file_value else None
+        if relative is not None and (relative.is_absolute() or ".." in relative.parts):
             raise DatabaseError(f"Solution image {index} file path must stay inside the position folder.")
         if not isinstance(description, str):
             raise DatabaseError(f"Solution image {index} description must be a string.")
@@ -226,7 +250,13 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
             score = normalized_solution_score
         elif not isinstance(score, str):
             raise DatabaseError(f"Solution image {index} score must be a score string or a positive/negative number.")
-        normalized_solutions.append({"file": relative.as_posix(), "description": description, "score": score})
+        normalized_solutions.append({
+            "kind": kind,
+            "file": relative.as_posix() if relative is not None else "",
+            "description": description,
+            "score": score,
+            "sgf_start_path": sgf_start_path,
+        })
     result["solution_images"] = normalized_solutions
     return result
 
@@ -326,6 +356,7 @@ def create_position(
     save_position(config, position_id, {
         "description": description,
         "score": "",
+        "sgf_start_path": [],
         "tags": list(dict.fromkeys(tags)),
         "metadata": metadata or {},
         "solution_images": [],

@@ -120,6 +120,8 @@ class GoPositionDatabase:
                 errors.append(f"{position_id}: {e}")
                 continue
             for solution_index, solution in enumerate(record.get("solution_images", []), start=1):
+                if solution.get("kind") == "board":
+                    continue
                 solution_path = d / solution["file"]
                 if not solution_path.exists():
                     errors.append(f"{position_id}: missing solution image {solution_index} ({solution['file']})")

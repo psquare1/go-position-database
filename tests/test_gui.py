@@ -24,7 +24,7 @@ from go_position_db.gui import (
     MainWindow,
     score_chip_stylesheet,
 )
-from go_position_db.storage import atomic_dump_yaml, save_position
+from go_position_db.storage import atomic_dump_yaml, load_position, save_position
 from go_position_db.tags import TagGraph
 
 
@@ -105,6 +105,23 @@ class GuiTests(unittest.TestCase):
         self.assertIn("Kitani vs Seigen", texts)
         self.assertIn("move", texts)
         self.assertIn("38", texts)
+
+    def test_search_card_prefers_rendered_sgf_over_image(self):
+        sgf_path = Path(self.tmp.name) / "position.sgf"
+        sgf_path.write_text("(;GM[1]FF[4]SZ[9];B[ee];W[gc])", encoding="utf-8")
+        card = SearchResultCard(
+            "p1", {"sgf_start_path": [0]}, None,
+            DISPLAY_MODES["Standard"], sgf_path=sgf_path,
+        )
+        self.assertEqual(card.sgf_start_path, [0])
+        self.assertFalse(card.image_label.pixmap().isNull())
+        self.assertEqual(card.image_label.text(), "")
+
+        missing = SearchResultCard(
+            "p2", {}, None, DISPLAY_MODES["Standard"],
+            sgf_path=Path(self.tmp.name) / "absent.sgf",
+        )
+        self.assertEqual(missing.image_label.text(), "No image")
 
     def test_position_tag_editor_creates_tags_and_keeps_only_descendants(self):
         atomic_dump_yaml(self.cfg.tags_file, {
@@ -197,6 +214,41 @@ class GuiTests(unittest.TestCase):
         self.assertTrue((directory / self.cfg.sgf_filename).exists())
         self.assertFalse((directory / "downloaded-game.sgf").exists())
         window.close()
+
+    def test_sgf_markup_edits_are_saved_to_the_position_copy(self):
+        position_id = "p000001"
+        directory = self.cfg.positions_dir / position_id
+        directory.mkdir()
+        sgf_path = directory / self.cfg.sgf_filename
+        sgf_path.write_text("(;GM[1]FF[4]SZ[9];B[ee])", encoding="utf-8")
+        save_position(self.cfg, position_id, {
+            "description": "",
+            "score": "",
+            "tags": [],
+            "metadata": {},
+            "solution_images": [],
+        })
+
+        editor = PositionEditor(self.cfg)
+        self.assertTrue(editor.load_position(position_id))
+        board = editor.image_gallery.sgf_board
+        board.annotation_buttons["triangles"].click()
+        board._toggle_annotation((0, 0))
+        self.assertIsNotNone(editor.pending_sgf_text)
+        self.assertNotIn("TR[ai]", sgf_path.read_text(encoding="utf-8"))
+
+        editor.add_solution_board()
+        self.assertEqual(editor.selected_image_index, 1)
+        self.assertEqual(editor.solution_images[0]["kind"], "board")
+        self.assertIs(editor.image_gallery.media_stack.currentWidget(), board)
+        board.next_button.click()
+        board.set_start_button.click()
+        self.assertEqual(editor.solution_images[0]["sgf_start_path"], [0])
+        self.assertTrue(editor.save_current())
+        self.assertIn("TR[ai]", sgf_path.read_text(encoding="utf-8"))
+        saved = load_position(self.cfg, position_id)
+        self.assertEqual(saved["solution_images"][0]["kind"], "board")
+        self.assertEqual(saved["solution_images"][0]["sgf_start_path"], [0])
 
 
 if __name__ == "__main__":

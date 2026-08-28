@@ -96,15 +96,31 @@ class CoreTests(unittest.TestCase):
         record.update({
             "name": "Retired display name",
             "score": "B +3.5",
+            "sgf_start_path": [0, 1],
             "solution_images": [
-                {"file": "solutions/solution-001.png", "description": "White resists", "score": "W +1.5"}
+                {
+                    "file": "solutions/solution-001.png",
+                    "description": "White resists",
+                    "score": "W +1.5",
+                    "sgf_start_path": [0, 1, 2],
+                },
+                {
+                    "kind": "board",
+                    "description": "An SGF-only continuation",
+                    "score": "",
+                    "sgf_start_path": [0, 2],
+                },
             ],
         })
         from go_position_db.storage import save_position
         save_position(self.cfg, "p1", record)
         loaded = load_position(self.cfg, "p1")
         self.assertNotIn("name", loaded)
+        self.assertEqual(loaded["sgf_start_path"], [0, 1])
         self.assertEqual(loaded["solution_images"][0]["score"], "W +1.5")
+        self.assertEqual(loaded["solution_images"][0]["sgf_start_path"], [0, 1, 2])
+        self.assertEqual(loaded["solution_images"][1]["kind"], "board")
+        self.assertEqual(loaded["solution_images"][1]["file"], "")
         self.assertEqual(formatted_score(loaded["score"]), "B +3.5")
         self.assertEqual(formatted_score("3.5"), "B +3.5")
         self.assertEqual(formatted_score("+2"), "B +2")
@@ -117,6 +133,11 @@ class CoreTests(unittest.TestCase):
         normalized = load_position(self.cfg, "p1")
         self.assertEqual(normalized["score"], "W +2.5")
         self.assertEqual(normalized["solution_images"][0]["score"], "B +3")
+
+        from go_position_db.storage import DatabaseError
+        record["sgf_start_path"] = [0, -1]
+        with self.assertRaises(DatabaseError):
+            save_position(self.cfg, "p1", record)
 
     def test_tag_names_are_canonical_and_operators_are_reserved(self):
         graph = TagGraph(self.cfg)

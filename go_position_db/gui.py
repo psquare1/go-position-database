@@ -64,6 +64,7 @@ from .storage import (
     position_sgf_path,
     save_position,
 )
+from .sgf_viewer import ReadOnlySgfBoard, render_sgf_board
 from .tags import TagGraph, normalize_tag_name, validate_new_tag_name
 
 IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)"
@@ -597,9 +598,19 @@ class ElidedLabel(QLabel):
         self.full_text = text
         self.max_lines = max_lines
         self.setWordWrap(True)
+        self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.setMaximumHeight(self.fontMetrics().lineSpacing() * max_lines + 4)
+        # A little slack over the line budget so the last kept line is never
+        # sliced horizontally when boundingRect and the painter disagree by a pixel.
+        self.setMaximumHeight(self._line_budget() + 6)
         QLabel.setText(self, text)
+
+    def _line_budget(self) -> int:
+        return self.fontMetrics().lineSpacing() * self.max_lines
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._refresh_text()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -608,17 +619,20 @@ class ElidedLabel(QLabel):
     def _refresh_text(self) -> None:
         width = max(1, self.contentsRect().width())
         metrics = self.fontMetrics()
-        maximum_height = metrics.lineSpacing() * self.max_lines
+        maximum_height = self._line_budget()
         bounds = QRect(0, 0, width, maximum_height)
-        if metrics.boundingRect(bounds, Qt.TextWordWrap, self.full_text).height() <= maximum_height:
+
+        def fits(candidate: str) -> bool:
+            return metrics.boundingRect(bounds, Qt.TextWordWrap, candidate).height() <= maximum_height
+
+        if fits(self.full_text):
             QLabel.setText(self, self.full_text)
             self.setToolTip("")
             return
         low, high = 0, len(self.full_text)
         while low < high:
             middle = (low + high + 1) // 2
-            candidate = self.full_text[:middle].rstrip() + "…"
-            if metrics.boundingRect(bounds, Qt.TextWordWrap, candidate).height() <= maximum_height:
+            if fits(self.full_text[:middle].rstrip() + "…"):
                 low = middle
             else:
                 high = middle - 1
@@ -629,9 +643,11 @@ class ElidedLabel(QLabel):
 class SearchResultCard(QFrame):
     open_requested = Signal(str)
 
-    def __init__(self, position_id: str, record: dict[str, Any], image_path: Path | None, options: SearchCardOptions, parent: QWidget | None = None):
+    def __init__(self, position_id: str, record: dict[str, Any], image_path: Path | None, options: SearchCardOptions, parent: QWidget | None = None, sgf_path: Path | None = None):
         super().__init__(parent)
         self.position_id = position_id
+        self.sgf_path = sgf_path
+        self.sgf_start_path = list(record.get("sgf_start_path", []) or [])
         self.setObjectName("searchResultCard")
         self.setFrameShape(QFrame.StyledPanel)
         if options.vertical:
@@ -766,6 +782,15 @@ class SearchResultCard(QFrame):
             layout.addLayout(body)
 
     def set_preview(self, image_path: Path | None, size: QSize) -> None:
+        if self.sgf_path is not None and self.sgf_path.exists():
+            board = render_sgf_board(
+                self.sgf_path,
+                self.sgf_start_path,
+                size=max(size.width(), size.height()),
+            )
+            if not board.isNull():
+                self.image_label.setPixmap(board.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                return
         if image_path is None or not image_path.exists():
             self.image_label.setText("No image")
             return
@@ -799,7 +824,7 @@ class ScaledImageLabel(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(360, 360)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setStyleSheet("background: #202124; border: 1px solid #3c4043;")
+        self.setStyleSheet("background: #f6f2f1; border: none;")
 
     def set_source_pixmap(self, pixmap: QPixmap, empty_text: str = "No image") -> None:
         self._source_pixmap = pixmap
@@ -838,22 +863,41 @@ class PositionImageGallery(QWidget):
         super().__init__(parent)
         layout = QGridLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        self.media_stack = QStackedWidget()
+        self.media_stack.setMinimumSize(300, 420)
         self.image_label = ScaledImageLabel()
-        self.image_label.setMinimumSize(300, 420)
-        layout.addWidget(self.image_label, 0, 0)
+        self.image_label.setMinimumSize(300, 360)
+        self.image_surface = QWidget()
+        image_surface_layout = QVBoxLayout(self.image_surface)
+        image_surface_layout.setContentsMargins(0, 0, 0, 0)
+        image_surface_layout.setSpacing(0)
+        image_surface_layout.addWidget(self.image_label, 1)
+        image_divider = QFrame()
+        image_divider.setFrameShape(QFrame.HLine)
+        image_divider.setStyleSheet("color: #b9cbd8; background: #b9cbd8; max-height: 1px;")
+        image_surface_layout.addWidget(image_divider)
+        image_control_space = QFrame()
+        image_control_space.setFixedHeight(ReadOnlySgfBoard.CONTROL_PANEL_HEIGHT - 1)
+        image_control_space.setStyleSheet("background: #fffafa; border: none;")
+        image_surface_layout.addWidget(image_control_space)
+        self.sgf_board = ReadOnlySgfBoard()
+        self.media_stack.addWidget(self.image_surface)
+        self.media_stack.addWidget(self.sgf_board)
+        layout.addWidget(self.media_stack, 0, 0)
 
         self.previous_button = QToolButton()
         self.previous_button.setText("‹")
         self.next_button = QToolButton()
         self.next_button.setText("›")
         for button in (self.previous_button, self.next_button):
-            button.setFixedSize(30, 48)
+            button.setFixedSize(30, 46)
             button.setAutoRaise(True)
             button.setStyleSheet(
-                "QToolButton { border: 1px solid rgba(255,255,255,120); color: white; "
-                "background: rgba(20,20,20,120); border-radius: 15px; font-size: 25px; padding: 0; }"
-                "QToolButton:hover { background: rgba(20,20,20,205); }"
-                "QToolButton:disabled { color: rgba(255,255,255,90); background: rgba(20,20,20,55); }"
+                "QToolButton { border: 1px solid #cfc5c8; color: #55464c; "
+                "background: rgba(255,253,253,235); border-radius: 10px; "
+                "font-size: 22px; font-weight: 700; padding: 0; }"
+                "QToolButton:hover { background: #f8e8ee; border-color: #d49aad; color: #673548; }"
+                "QToolButton:disabled { color: #c9bfc2; background: rgba(255,253,253,140); }"
             )
         layout.addWidget(self.previous_button, 0, 0, Qt.AlignLeft | Qt.AlignVCenter)
         layout.addWidget(self.next_button, 0, 0, Qt.AlignRight | Qt.AlignVCenter)
@@ -863,12 +907,35 @@ class PositionImageGallery(QWidget):
         self.position_label.hide()
 
         self.images: list[tuple[str, QPixmap]] = []
+        self.has_sgf = False
+        self.sgf_path: Path | None = None
+        self.sgf_text: str | None = None
+        self.board_start_paths: dict[int, list[int]] = {}
         self.selected_index = 0
         self.previous_button.clicked.connect(lambda: self.select_image(self.selected_index - 1))
         self.next_button.clicked.connect(lambda: self.select_image(self.selected_index + 1))
+        self.sgf_board.sgf_edited.connect(self._remember_sgf_text)
 
-    def set_images(self, images: list[tuple[str, QPixmap]]) -> None:
+    def _remember_sgf_text(self, text: str) -> None:
+        self.sgf_text = text
+
+    def set_images(
+        self,
+        images: list[tuple[str, QPixmap]],
+        sgf_path: Path | None = None,
+        sgf_start_path: list[int] | tuple[int, ...] = (),
+        sgf_text: str | None = None,
+        board_start_paths: dict[int, list[int]] | None = None,
+    ) -> None:
         self.images = images
+        self.has_sgf = sgf_path is not None or sgf_text is not None
+        self.sgf_path = sgf_path
+        self.sgf_text = sgf_text
+        self.board_start_paths = dict(board_start_paths or {})
+        if self.has_sgf:
+            self.board_start_paths.setdefault(0, list(sgf_start_path))
+        else:
+            self.sgf_board.clear()
         self.select_image(min(self.selected_index, max(0, len(images) - 1)), emit=False)
 
     def select_image(self, index: int, emit: bool = True) -> None:
@@ -877,6 +944,16 @@ class PositionImageGallery(QWidget):
         self.selected_index = index
         title, pixmap = self.images[index]
         self.image_label.set_source_pixmap(pixmap, "No image")
+        show_board = self.has_sgf and index in self.board_start_paths
+        if show_board:
+            start_path = self.board_start_paths[index]
+            if self.sgf_text is not None:
+                self.sgf_board.load_text(self.sgf_text, start_path)
+            elif self.sgf_path is not None:
+                self.sgf_board.load_file(self.sgf_path, start_path)
+            self.media_stack.setCurrentWidget(self.sgf_board)
+        else:
+            self.media_stack.setCurrentWidget(self.image_surface)
         has_multiple = len(self.images) > 1
         self.previous_button.setVisible(has_multiple)
         self.next_button.setVisible(has_multiple)
@@ -903,10 +980,12 @@ class PositionEditor(QWidget):
         self.pending_image_path: Path | None = None
         self.pending_image: QImage | None = None
         self.pending_sgf_path: Path | None = None
+        self.pending_sgf_text: str | None = None
         self.clear_sgf_on_save = False
         self.main_description = ""
         self.main_score = ""
-        self.solution_images: list[dict[str, str]] = []
+        self.main_sgf_start_path: list[int] = []
+        self.solution_images: list[dict[str, Any]] = []
         self.pending_solution_sources: dict[str, Path | QImage] = {}
         self.solution_files_to_delete: set[str] = set()
         self.selected_image_index = 0
@@ -948,6 +1027,7 @@ class PositionEditor(QWidget):
         solutions_menu = QMenu(self.solutions_menu_btn)
         solutions_menu.addAction("Add image(s)…", self.add_solution_images)
         solutions_menu.addAction("Paste image", self.paste_solution_image)
+        solutions_menu.addAction("Add board", self.add_solution_board)
         solutions_menu.addSeparator()
         solutions_menu.addAction("Replace selected…", self.replace_selected_solution)
         solutions_menu.addAction("Remove selected", self.remove_selected_solution)
@@ -983,16 +1063,16 @@ class PositionEditor(QWidget):
         self.editor_splitter.setChildrenCollapsible(False)
         image_panel = QWidget()
         image_panel_layout = QVBoxLayout(image_panel)
-        image_panel_layout.setContentsMargins(0, 5, 0, 0)
+        image_panel_layout.setContentsMargins(0, 0, 0, 0)
         image_panel_layout.setSpacing(4)
         self.image_gallery = PositionImageGallery()
-        self.image_gallery.setMinimumWidth(550)
+        self.image_gallery.setMinimumWidth(585)
         image_panel_layout.addWidget(self.image_gallery, 1)
         self.editor_splitter.addWidget(image_panel)
 
         details = QWidget()
         details.setMinimumWidth(430)
-        details.setMaximumWidth(760)
+        details.setMaximumWidth(880)
         details_layout = QVBoxLayout(details)
         details_layout.setContentsMargins(0, 0, 0, 0)
         details_layout.setSpacing(8)
@@ -1017,9 +1097,9 @@ class PositionEditor(QWidget):
         details_layout.addWidget(metadata_box, 2)
 
         self.editor_splitter.addWidget(details)
-        self.editor_splitter.setStretchFactor(0, 13)
-        self.editor_splitter.setStretchFactor(1, 9)
-        self.editor_splitter.setSizes([880, 620])
+        self.editor_splitter.setStretchFactor(0, 5)
+        self.editor_splitter.setStretchFactor(1, 4)
+        self.editor_splitter.setSizes([820, 700])
         layout.addWidget(self.editor_splitter, 1)
 
         self.back_btn.clicked.connect(self.back_requested.emit)
@@ -1034,6 +1114,8 @@ class PositionEditor(QWidget):
         self.tags_editor.tag_created.connect(lambda _name: self.database_changed.emit())
         self.metadata_editor.changed.connect(self.schedule_autosave)
         self.image_gallery.image_selected.connect(self.select_image)
+        self.image_gallery.sgf_board.start_requested.connect(self.set_selected_sgf_start_path)
+        self.image_gallery.sgf_board.sgf_edited.connect(self.set_pending_sgf_text)
 
         self.setEnabled(False)
 
@@ -1049,7 +1131,9 @@ class PositionEditor(QWidget):
         return QPixmap(str(path)) if path and path.exists() else QPixmap()
 
     def _solution_pixmap(self, solution: dict[str, str]) -> QPixmap:
-        relative = solution["file"]
+        relative = solution.get("file", "")
+        if not relative:
+            return QPixmap()
         pending = self.pending_solution_sources.get(relative)
         if isinstance(pending, QImage):
             return QPixmap.fromImage(pending)
@@ -1063,13 +1147,45 @@ class PositionEditor(QWidget):
     def refresh_gallery(self, selected_index: int | None = None) -> None:
         index = self.selected_image_index if selected_index is None else selected_index
         images = [("Main image", self._main_pixmap())]
+        board_start_paths: dict[int, list[int]] = {}
         for solution_index, solution in enumerate(self.solution_images, start=1):
             score = formatted_score(solution.get("score", ""))
-            title = f"Solution {solution_index}" + (f" · {score}" if score else "")
+            prefix = "Board solution" if solution.get("kind") == "board" else "Solution"
+            title = f"{prefix} {solution_index}" + (f" · {score}" if score else "")
             images.append((title, self._solution_pixmap(solution)))
+            if solution.get("kind") == "board":
+                board_start_paths[solution_index] = list(solution.get("sgf_start_path", []))
         self.image_gallery.selected_index = min(index, len(images) - 1)
-        self.image_gallery.set_images(images)
+        self.image_gallery.set_images(
+            images,
+            self._current_sgf_path(),
+            self.main_sgf_start_path,
+            self.pending_sgf_text,
+            board_start_paths,
+        )
         self.select_image(self.image_gallery.selected_index)
+
+    def set_pending_sgf_text(self, text: str) -> None:
+        self.pending_sgf_text = text
+        self.clear_sgf_on_save = False
+        self.schedule_autosave()
+
+    def set_selected_sgf_start_path(self, path: list[int]) -> None:
+        if self.selected_image_index == 0:
+            self.main_sgf_start_path = list(path)
+        elif self.selected_image_index - 1 < len(self.solution_images):
+            self.solution_images[self.selected_image_index - 1]["sgf_start_path"] = list(path)
+        self.image_gallery.board_start_paths[self.selected_image_index] = list(path)
+        self.schedule_autosave()
+
+    def _current_sgf_path(self) -> Path | None:
+        if self.clear_sgf_on_save:
+            return None
+        if self.pending_sgf_path is not None:
+            return self.pending_sgf_path
+        if self.current_position_id:
+            return position_sgf_path(self.config, self.current_position_id)
+        return None
 
     def select_image(self, index: int) -> None:
         if not 0 <= index <= len(self.solution_images):
@@ -1153,12 +1269,14 @@ class PositionEditor(QWidget):
         self.pending_image_path = None
         self.pending_image = None
         self.pending_sgf_path = None
+        self.pending_sgf_text = None
         self.clear_sgf_on_save = False
         self.pending_solution_sources = {}
         self.solution_files_to_delete = set()
         self.solution_images = []
         self.main_description = ""
         self.main_score = ""
+        self.main_sgf_start_path = []
         self.selected_image_index = 0
         self.transient_new_position = False
         self.position_id_label.clear()
@@ -1186,12 +1304,14 @@ class PositionEditor(QWidget):
         self.pending_image_path = None
         self.pending_image = None
         self.pending_sgf_path = None
+        self.pending_sgf_text = None
         self.clear_sgf_on_save = False
         self.pending_solution_sources = {}
         self.solution_files_to_delete = set()
         self.solution_images = [dict(item) for item in record.get("solution_images", [])]
         self.main_description = record.get("description", "")
         self.main_score = record.get("score", "")
+        self.main_sgf_start_path = list(record.get("sgf_start_path", []))
         self.selected_image_index = 0
         self.tags_editor.set_tags(record.get("tags", []))
         self.metadata_editor.set_metadata(record.get("metadata", {}) or {})
@@ -1234,14 +1354,18 @@ class PositionEditor(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "Choose SGF", str(self.config.root), SGF_FILTER)
         if path:
             self.pending_sgf_path = Path(path)
+            self.pending_sgf_text = None
             self.clear_sgf_on_save = False
+            self.refresh_gallery(0)
             self.schedule_autosave()
 
     def mark_clear_sgf(self) -> None:
         if not self.current_position_id:
             return
         self.pending_sgf_path = None
+        self.pending_sgf_text = None
         self.clear_sgf_on_save = True
+        self.refresh_gallery(0)
         self.schedule_autosave()
 
     def open_folder(self) -> None:
@@ -1251,7 +1375,7 @@ class PositionEditor(QWidget):
 
     def _next_solution_relative(self, suffix: str) -> str:
         suffix = suffix.lower() if suffix.startswith(".") else f".{suffix.lower()}"
-        used = {item["file"] for item in self.solution_images}
+        used = {item.get("file", "") for item in self.solution_images}
         number = 1
         while True:
             candidate = f"solutions/solution-{number:03d}{suffix}"
@@ -1264,7 +1388,15 @@ class PositionEditor(QWidget):
         for path_text in paths:
             path = Path(path_text)
             relative = self._next_solution_relative(path.suffix)
-            self.solution_images.append({"file": relative, "description": "", "score": ""})
+            current_path = list(self.image_gallery.sgf_board.current_frame.node_path) \
+                if self.image_gallery.sgf_board.current_frame else []
+            self.solution_images.append({
+                "kind": "image",
+                "file": relative,
+                "description": "",
+                "score": "",
+                "sgf_start_path": current_path,
+            })
             self.pending_solution_sources[relative] = path
         if paths:
             self.refresh_gallery(len(self.solution_images))
@@ -1276,8 +1408,30 @@ class PositionEditor(QWidget):
             QMessageBox.information(self, "Paste Solution", "Clipboard does not currently contain an image.")
             return
         relative = self._next_solution_relative(".png")
-        self.solution_images.append({"file": relative, "description": "", "score": ""})
+        current_path = list(self.image_gallery.sgf_board.current_frame.node_path) \
+            if self.image_gallery.sgf_board.current_frame else []
+        self.solution_images.append({
+            "kind": "image",
+            "file": relative,
+            "description": "",
+            "score": "",
+            "sgf_start_path": current_path,
+        })
         self.pending_solution_sources[relative] = image
+        self.refresh_gallery(len(self.solution_images))
+        self.schedule_autosave()
+
+    def add_solution_board(self) -> None:
+        if self._current_sgf_path() is None and self.pending_sgf_text is None:
+            QMessageBox.information(self, "Add Board", "Attach an SGF before adding a board solution.")
+            return
+        self.solution_images.append({
+            "kind": "board",
+            "file": "",
+            "description": "",
+            "score": "",
+            "sgf_start_path": [],
+        })
         self.refresh_gallery(len(self.solution_images))
         self.schedule_autosave()
 
@@ -1289,10 +1443,12 @@ class PositionEditor(QWidget):
         if not path_text:
             return
         solution = self.solution_images[self.selected_image_index - 1]
-        old_relative = solution["file"]
-        self.pending_solution_sources.pop(old_relative, None)
-        self.solution_files_to_delete.add(old_relative)
+        old_relative = solution.get("file", "")
+        if old_relative:
+            self.pending_solution_sources.pop(old_relative, None)
+            self.solution_files_to_delete.add(old_relative)
         new_relative = self._next_solution_relative(Path(path_text).suffix)
+        solution["kind"] = "image"
         solution["file"] = new_relative
         self.pending_solution_sources[new_relative] = Path(path_text)
         self.refresh_gallery(self.selected_image_index)
@@ -1302,12 +1458,13 @@ class PositionEditor(QWidget):
         if self.selected_image_index == 0:
             QMessageBox.information(self, "Remove Solution", "Select a solution image first.")
             return
-        if QMessageBox.question(self, "Remove Solution", "Remove the selected solution image?") != QMessageBox.Yes:
+        if QMessageBox.question(self, "Remove Solution", "Remove the selected solution?") != QMessageBox.Yes:
             return
         solution = self.solution_images.pop(self.selected_image_index - 1)
-        relative = solution["file"]
-        self.pending_solution_sources.pop(relative, None)
-        self.solution_files_to_delete.add(relative)
+        relative = solution.get("file", "")
+        if relative:
+            self.pending_solution_sources.pop(relative, None)
+            self.solution_files_to_delete.add(relative)
         self.refresh_gallery(max(0, self.selected_image_index - 1))
         self.schedule_autosave()
 
@@ -1364,7 +1521,7 @@ class PositionEditor(QWidget):
         media_dir = position_dir(self.config, self.current_position_id)
         has_main_image = self.pending_image is not None or self.pending_image_path is not None
         has_main_image = has_main_image or position_image_path(self.config, self.current_position_id) is not None
-        has_sgf = self.pending_sgf_path is not None
+        has_sgf = self.pending_sgf_path is not None or self.pending_sgf_text is not None
         has_sgf = has_sgf or (not self.clear_sgf_on_save and position_sgf_path(self.config, self.current_position_id) is not None)
         return any((
             self.main_description.strip(),
@@ -1410,6 +1567,10 @@ class PositionEditor(QWidget):
 
         if self.clear_sgf_on_save:
             remove_matching_files(dest_dir, self.config.sgf_extensions)
+        elif self.pending_sgf_text is not None:
+            remove_matching_files(dest_dir, self.config.sgf_extensions)
+            dest = dest_dir / self.config.sgf_filename
+            dest.write_text(self.pending_sgf_text, encoding="utf-8")
         elif self.pending_sgf_path is not None:
             sgf_bytes = self.pending_sgf_path.read_bytes()
             remove_matching_files(dest_dir, self.config.sgf_extensions)
@@ -1457,6 +1618,7 @@ class PositionEditor(QWidget):
             record = {
                 "description": self.main_description.strip(),
                 "score": main_score,
+                "sgf_start_path": list(self.main_sgf_start_path),
                 "tags": tags,
                 "metadata": self._parse_metadata(),
                 "solution_images": solution_records,
@@ -1478,6 +1640,7 @@ class PositionEditor(QWidget):
         self.pending_image_path = None
         self.pending_image = None
         self.pending_sgf_path = None
+        self.pending_sgf_text = None
         self.clear_sgf_on_save = False
         self.pending_solution_sources = {}
         self.solution_files_to_delete = set()
@@ -2224,9 +2387,10 @@ class MainWindow(QMainWindow):
             try:
                 record = load_position(self.config, pid)
                 image_path = position_image_path(self.config, pid)
+                sgf_path = position_sgf_path(self.config, pid)
             except Exception:
                 continue
-            card = SearchResultCard(pid, record, image_path, mode)
+            card = SearchResultCard(pid, record, image_path, mode, sgf_path=sgf_path)
             card.open_requested.connect(self.open_position)
             row, column = divmod(index, mode.columns)
             self.results_layout.addWidget(card, row, column)
@@ -2295,6 +2459,7 @@ class MainWindow(QMainWindow):
             save_position(self.config, position_id, {
                 "description": "",
                 "score": "",
+                "sgf_start_path": [],
                 "tags": [],
                 "metadata": {},
                 "solution_images": [],
