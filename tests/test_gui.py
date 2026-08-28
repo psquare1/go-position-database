@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSize
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPlainTextEdit
 
 from go_position_db.config import Config
@@ -117,6 +118,17 @@ class GuiTests(unittest.TestCase):
         self.assertFalse(card.image_label.pixmap().isNull())
         self.assertEqual(card.image_label.text(), "")
 
+        image_path = Path(self.tmp.name) / "board.png"
+        image = QPixmap(QSize(20, 20))
+        image.fill(QColor("#ff0000"))
+        self.assertTrue(image.save(str(image_path)))
+        image_card = SearchResultCard(
+            "p1", {"main_media_kind": "image", "sgf_start_path": [0]}, image_path,
+            DISPLAY_MODES["Standard"], sgf_path=sgf_path,
+        )
+        preview = image_card.image_label.pixmap().toImage()
+        self.assertGreater(preview.pixelColor(preview.width() // 2, preview.height() // 2).red(), 240)
+
         missing = SearchResultCard(
             "p2", {}, None, DISPLAY_MODES["Standard"],
             sgf_path=Path(self.tmp.name) / "absent.sgf",
@@ -152,11 +164,27 @@ class GuiTests(unittest.TestCase):
     def test_standard_view_uses_three_columns(self):
         self.assertEqual(DISPLAY_MODES["Standard"].columns, 3)
 
-    def test_visual_chips_use_query_and_score_variants(self):
+    def test_colored_query_tags_preserve_normal_editing_and_score_variants(self):
         query = TagQueryLineEdit()
+        query.set_boolean_query_mode()
+        self.assertEqual(query.textMargins().left(), 10)
         query.resize(500, 42)
-        query.setText("joseki AND reverse-sente")
+        query.set_tag_names(["joseki", "sente", "reverse-sente"])
         query.show()
+        query.setFocus()
+        QTest.keyClicks(query, "joseki")
+        self.assertEqual(len(query._tag_matches(query.text())), 1)
+        QTest.keyClick(query, Qt.Key_Backspace)
+        self.assertEqual(query.text(), "josek")
+        self.assertEqual(query._tag_matches(query.text()), [])
+        QTest.keyClicks(query, "i and not sente")
+        self.assertEqual(query.text(), "joseki and not sente")
+        self.assertEqual(len(query._tag_matches(query.text())), 2)
+        self.assertEqual(query.cursorPosition(), len(query.text()))
+        searches = []
+        query.returnPressed.connect(lambda: searches.append(query.text()))
+        QTest.keyClick(query, Qt.Key_Return)
+        self.assertEqual(searches, [query.text()])
         self.app.processEvents()
         self.assertFalse(query.grab().isNull())
 
@@ -178,17 +206,11 @@ class GuiTests(unittest.TestCase):
         editor._normalize_score_input()
         self.assertEqual(editor.score_edit.text(), "B +3")
 
-        editor.setEnabled(True)
-        editor.show()
-        editor.score_edit.setFocus()
-        self.app.processEvents()
-        self.assertTrue(editor.score_edit.hasFocus())
-        self.assertEqual(editor.score_edit.styleSheet(), "")
+        self.assertTrue(editor.score_edit.isHidden())
         editor.score_edit.setText("-2.75")
         editor._commit_score_input()
         self.app.processEvents()
         self.assertEqual(editor.score_edit.text(), "W +2.75")
-        self.assertFalse(editor.score_edit.hasFocus())
         self.assertIn("border-radius: 18px", editor.score_edit.styleSheet())
         editor.close()
 
@@ -213,6 +235,7 @@ class GuiTests(unittest.TestCase):
         window = MainWindow(self.cfg.root)
         self.assertTrue((directory / self.cfg.sgf_filename).exists())
         self.assertFalse((directory / "downloaded-game.sgf").exists())
+        self.assertIs(window.editor.save_status_label.parentWidget(), window.statusBar())
         window.close()
 
     def test_sgf_markup_edits_are_saved_to_the_position_copy(self):
@@ -231,24 +254,107 @@ class GuiTests(unittest.TestCase):
 
         editor = PositionEditor(self.cfg)
         self.assertTrue(editor.load_position(position_id))
+        self.assertTrue(editor.score_edit.isHidden())
         board = editor.image_gallery.sgf_board
         board.annotation_buttons["triangles"].click()
         board._toggle_annotation((0, 0))
         self.assertIsNotNone(editor.pending_sgf_text)
         self.assertNotIn("TR[ai]", sgf_path.read_text(encoding="utf-8"))
 
+        board.next_button.click()
         editor.add_solution_board()
         self.assertEqual(editor.selected_image_index, 1)
         self.assertEqual(editor.solution_images[0]["kind"], "board")
-        self.assertIs(editor.image_gallery.media_stack.currentWidget(), board)
-        board.next_button.click()
-        board.set_start_button.click()
         self.assertEqual(editor.solution_images[0]["sgf_start_path"], [0])
+        self.assertIs(editor.image_gallery.media_stack.currentWidget(), board)
+        self.assertEqual(editor.baseline_menu_button.text(), "Set baseline")
+        self.assertEqual(editor.baseline_menu_button.toolTip(), "Selected baseline: board")
+        baseline_actions = {
+            action.text(): action
+            for action in editor.baseline_menu_button.menu().actions()
+            if action.text()
+        }
+        self.assertEqual(
+            set(baseline_actions),
+            {
+                "Image from file…", "Image from clipboard", "Current SGF node",
+                "Display SGF board", "Display image",
+            },
+        )
+        self.assertTrue(baseline_actions["Display SGF board"].isChecked())
+        self.assertFalse(baseline_actions["Display image"].isEnabled())
+        baseline_actions["Current SGF node"].trigger()
+        self.assertEqual(editor.solution_images[0]["sgf_start_path"], [0])
+
+        solution_image = QPixmap(QSize(20, 20))
+        solution_image.fill(QColor("#ff0000"))
+        solution_file = "solutions/solution-001.png"
+        editor.solution_images[0]["file"] = solution_file
+        editor.pending_solution_sources[solution_file] = solution_image.toImage()
+        editor.refresh_gallery(1)
+        baseline_actions = {
+            action.text(): action
+            for action in editor.baseline_menu_button.menu().actions()
+            if action.text()
+        }
+        self.assertTrue(baseline_actions["Display image"].isEnabled())
+        baseline_actions["Display image"].trigger()
+        self.assertEqual(editor.solution_images[0]["kind"], "image")
+        self.assertIs(
+            editor.image_gallery.media_stack.currentWidget(),
+            editor.image_gallery.image_surface,
+        )
+        baseline_actions = {
+            action.text(): action
+            for action in editor.baseline_menu_button.menu().actions()
+            if action.text()
+        }
+        baseline_actions["Display SGF board"].trigger()
+        self.assertEqual(editor.solution_images[0]["kind"], "board")
+        self.assertEqual(len(editor.solution_tab_buttons), 2)
+        self.assertEqual(editor.solution_tab_buttons[0].text(), "Main")
+        self.assertEqual(editor.solution_tab_buttons[1].text(), "S1")
+        editor.resize(1500, 900)
+        editor.show()
+        self.app.processEvents()
+        solution_controls_geometry = editor.solution_controls.geometry()
+        initial_strip_left = editor.solution_strip.geometry().left()
+        initial_strip_width = editor.solution_strip.width()
+        initial_baseline_left = editor.baseline_menu_button.geometry().left()
+        self.assertEqual(editor.solution_strip.height(), 40)
+        self.assertTrue(all(button.height() == 34 for button in editor.solution_tab_buttons))
+        self.assertEqual(editor.sgf_menu_btn.size(), editor.open_folder_btn.size())
+        self.assertEqual(editor.open_folder_btn.size(), editor.delete_btn.size())
+        self.assertEqual(editor.back_btn.height(), editor.sgf_menu_btn.height())
+        self.assertEqual(editor.baseline_menu_button.height(), editor.sgf_menu_btn.height())
+        self.assertEqual(editor.solution_delete_button.height(), editor.sgf_menu_btn.height())
+        editor.refresh_gallery(0)
+        self.app.processEvents()
+        self.assertEqual(editor.solution_controls.geometry(), solution_controls_geometry)
+        self.assertEqual(editor.solution_delete_button.text(), "")
+        self.assertFalse(editor.solution_delete_button.isEnabled())
+        editor.refresh_gallery(1)
+        self.app.processEvents()
+        self.assertEqual(editor.solution_controls.geometry(), solution_controls_geometry)
+        self.assertEqual(editor.solution_delete_button.text(), "Del")
         self.assertTrue(editor.save_current())
         self.assertIn("TR[ai]", sgf_path.read_text(encoding="utf-8"))
         saved = load_position(self.cfg, position_id)
         self.assertEqual(saved["solution_images"][0]["kind"], "board")
         self.assertEqual(saved["solution_images"][0]["sgf_start_path"], [0])
+
+        # Main plus five solutions fit before the overflow menu is needed.
+        for _ in range(4):
+            editor.add_solution_board()
+        self.app.processEvents()
+        self.assertEqual(
+            [button.text() for button in editor.solution_tab_buttons],
+            ["Main", "S1", "S2", "S3", "S4", "S5"],
+        )
+        self.assertEqual(editor.solution_strip.geometry().left(), initial_strip_left)
+        self.assertGreater(editor.solution_strip.width(), initial_strip_width)
+        self.assertLessEqual(editor.solution_strip.width(), editor.solution_strip_slot.width())
+        self.assertEqual(editor.baseline_menu_button.geometry().left(), initial_baseline_left)
 
 
 if __name__ == "__main__":

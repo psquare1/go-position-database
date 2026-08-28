@@ -91,7 +91,7 @@ class SgfViewerTests(unittest.TestCase):
         self.assertEqual(board.current_frame.node_path, (0, 1))
         starts = []
         board.start_requested.connect(starts.append)
-        board.set_start_button.click()
+        board.request_current_start()
         self.assertEqual(starts, [[0, 1]])
         board.first_button.click()
         board.refresh_button.click()
@@ -122,7 +122,17 @@ class SgfViewerTests(unittest.TestCase):
             self.assertAlmostEqual(wood_left, wood, delta=1.0)
         self.assertGreater(wood_left, 0.0)
         self.assertEqual(board.delete_node_button.text(), "Del")
-        self.assertFalse(board.delete_node_button.isEnabled())
+        self.assertTrue(board.delete_node_button.isEnabled())
+        self.assertEqual(board.annotation_buttons["numbers"].text(), "1")
+        self.assertEqual(
+            list(board.edit_mode_buttons),
+            ["play", "black_setup", "white_setup", "erase"],
+        )
+        self.assertTrue(board.edit_mode_buttons["play"].isChecked())
+        self.assertIn("border-left: none", board.edit_mode_buttons["play"].styleSheet())
+        self.assertIn("border-right: none", board.edit_mode_buttons["erase"].styleSheet())
+        self.assertIn("border-left: 2px solid #9fc2d8", board.variation_previous_button.styleSheet())
+        self.assertIn("border-right: none", board.refresh_button.styleSheet())
         self.assertIn("border-left", board.first_button.styleSheet())
         self.assertTrue(all(
             "border-bottom" in button.styleSheet()
@@ -153,6 +163,10 @@ class SgfViewerTests(unittest.TestCase):
         self.app.processEvents()
         self.assertIs(gallery.media_stack.currentWidget(), gallery.image_surface)
         self.assertEqual(gallery.image_surface.size(), gallery.media_stack.contentsRect().size())
+        self.assertEqual(
+            gallery.image_surface._content_rects(),
+            gallery.sgf_board._content_rects(),
+        )
         gallery.close()
 
     def test_annotation_tools_edit_current_node_and_emit_updated_sgf(self):
@@ -177,9 +191,52 @@ class SgfViewerTests(unittest.TestCase):
         self.assertIn((0, 0, "1"), board.current_frame.labels)
         self.assertIn((1, 0, "2"), board.current_frame.labels)
 
+        board.annotation_buttons["letters"].click()
+        board._toggle_annotation((2, 0))
+        board._toggle_annotation((3, 0))
+        self.assertIn((2, 0, "A"), board.current_frame.labels)
+        self.assertIn((3, 0, "B"), board.current_frame.labels)
+
         reloaded = ReadOnlySgfBoard()
         self.assertTrue(reloaded.load_text(edits[-1], [0, 1]))
         self.assertIn((1, 0, "2"), reloaded.current_frame.labels)
+
+    def test_play_setup_erase_and_side_to_move_edit_the_sgf(self):
+        board = ReadOnlySgfBoard()
+        self.assertTrue(board.load_file(self.sgf_path))
+        edits = []
+        board.sgf_edited.connect(edits.append)
+
+        # Clicking the already-selected play tool explicitly changes whose turn it is.
+        self.assertEqual(board._current_player_to_move(), "B")
+        board.edit_mode_buttons["play"].click()
+        self.assertEqual(board._current_player_to_move(), "W")
+        self.assertEqual(board.edit_mode_buttons["play"].player, "W")
+
+        board.edit_mode_buttons["black_setup"].click()
+        board._edit_board_point((1, 3))
+        stones = {(x, y): player for x, y, player, _number in board.current_frame.stones}
+        self.assertEqual(stones[(1, 3)], "B")
+
+        board.edit_mode_buttons["white_setup"].click()
+        board._edit_board_point((1, 3))
+        stones = {(x, y): player for x, y, player, _number in board.current_frame.stones}
+        self.assertEqual(stones[(1, 3)], "W")
+
+        board.edit_mode_buttons["erase"].click()
+        board._edit_board_point((1, 3))
+        stones = {(x, y): player for x, y, player, _number in board.current_frame.stones}
+        self.assertNotIn((1, 3), stones)
+
+        board.edit_mode_buttons["play"].click()
+        board._edit_board_point((4, 4))
+        self.assertEqual(board.current_frame.last_move, (4, 4))
+        self.assertEqual(board.current_frame.last_player, "W")
+        self.assertTrue(board.delete_node_button.isEnabled())
+        board.delete_current_node(confirm=False)
+        self.assertEqual(board.current_frame.node_path, ())
+        self.assertFalse(board.delete_node_button.isEnabled())
+        self.assertTrue(edits)
 
     def test_render_sgf_board_thumbnail_for_search_results(self):
         thumb = render_sgf_board(self.sgf_path, [0, 0], size=200)

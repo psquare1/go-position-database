@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from PySide6.QtCore import QEvent, QRect, Qt, QSize, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QRect, QRectF, Qt, QSize, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QClipboard, QDesktopServices, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -64,7 +64,7 @@ from .storage import (
     position_sgf_path,
     save_position,
 )
-from .sgf_viewer import ReadOnlySgfBoard, render_sgf_board
+from .sgf_viewer import ReadOnlySgfBoard, media_card_rects, render_sgf_board
 from .tags import TagGraph, normalize_tag_name, validate_new_tag_name
 
 IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)"
@@ -151,14 +151,21 @@ class TagQueryLineEdit(QLineEdit):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._tag_names: list[str] = []
+        self._boolean_query_mode = False
         self._completer = QCompleter(self)
         self._completer.setCaseSensitivity(Qt.CaseInsensitive)
         self._completer.setFilterMode(Qt.MatchContains)
         self._completer.setCompletionMode(QCompleter.PopupCompletion)
         self._completer.setMaxVisibleItems(12)
         self._completer.setWidget(self)
+        self.setTextMargins(10, 0, 10, 0)
         self._completer.activated.connect(self._insert_completion)
-        self.textEdited.connect(self._refresh_completion_prefix)
+        self.textEdited.connect(self._on_text_edited)
+
+    def set_boolean_query_mode(self, enabled: bool = True) -> None:
+        # Kept for callers that distinguish the browse query from tag-entry fields.
+        # Query editing itself deliberately remains ordinary QLineEdit editing.
+        self._boolean_query_mode = enabled
 
     def set_tag_names(self, names: list[str]) -> None:
         self._tag_names = [normalize_tag_name(name) for name in names]
@@ -184,6 +191,24 @@ class TagQueryLineEdit(QLineEdit):
     def _current_token(self) -> str:
         start, end = self._token_bounds()
         return self.text()[start:end].strip('"\'')
+
+    def _is_existing_tag(self, token: str) -> bool:
+        return token.strip('"\'').casefold() in {tag.casefold() for tag in self._tag_names}
+
+    def _tag_matches(self, text: str) -> list[re.Match[str]]:
+        token_pattern = re.compile(r'"[^"\n]*"|\'[^\'\n]*\'|[^\s()]+')
+        return [
+            match for match in token_pattern.finditer(text)
+            if self._is_existing_tag(match.group(0))
+        ]
+
+    # Compatibility for code/tests written while completed tags were chips.
+    def _chip_matches(self, text: str) -> list[re.Match[str]]:
+        return self._tag_matches(text)
+
+    def _on_text_edited(self) -> None:
+        self._refresh_completion_prefix()
+        self.update()
 
     def _refresh_completion_prefix(self) -> None:
         token = self._current_token()
@@ -239,48 +264,29 @@ class TagQueryLineEdit(QLineEdit):
         return contains[0] if contains else None
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
+        # Let QLineEdit paint its own text, selection, and cursor.  Drawing only a
+        # colored copy of recognized tag glyphs preserves exact editing geometry.
+        super().paintEvent(event)
         text = self.text()
         if not text:
-            super().paintEvent(event)
             return
-        original_palette = self.palette()
-        hidden_palette = self.palette()
-        transparent = QColor(0, 0, 0, 0)
-        hidden_palette.setColor(hidden_palette.ColorRole.Text, transparent)
-        hidden_palette.setColor(hidden_palette.ColorRole.HighlightedText, transparent)
-        self.setPalette(hidden_palette)
-        super().paintEvent(event)
-        self.setPalette(original_palette)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setClipRect(self.contentsRect())
         metrics = self.fontMetrics()
         cursor = self.cursorPosition()
         text_offset = self.cursorRect().x() - metrics.horizontalAdvance(text[:cursor])
-        chip_height = min(25, max(21, self.height() - 12))
-        chip_top = (self.height() - chip_height) // 2
-        padding = 3
         selection_start = self.selectionStart()
         selection_end = selection_start + len(self.selectedText()) if selection_start >= 0 else -1
-        baseline = chip_top + (chip_height + metrics.ascent() - metrics.descent()) // 2
-        painter.setPen(original_palette.text().color())
-        painter.drawText(text_offset, baseline, text)
-        token_pattern = re.compile(r'"[^"\n]*"|\'[^\'\n]*\'|[^\s()]+')
-        for match in token_pattern.finditer(text):
+        baseline = (self.height() - metrics.height()) // 2 + metrics.ascent()
+        painter.setPen(QColor("#a34f70"))
+        for match in self._tag_matches(text):
             start, end = match.span()
             if selection_start >= 0 and start < selection_end and end > selection_start:
                 continue
             token = match.group(0)
-            if token.strip('"\'').casefold() in {"and", "or", "not"}:
-                continue
-            x = text_offset + metrics.horizontalAdvance(text[:start]) - padding
-            width = metrics.horizontalAdvance(token) + padding * 2
-            rect = QRect(x, chip_top, width, chip_height)
-            painter.setPen(QPen(QColor("#dfa7ba"), 1))
-            painter.setBrush(QColor("#f6dce5"))
-            painter.drawRoundedRect(rect, chip_height / 2, chip_height / 2)
-            painter.setPen(QColor("#683748"))
-            painter.drawText(x + padding, baseline, token)
+            x = text_offset + metrics.horizontalAdvance(text[:start])
+            painter.drawText(x, baseline, token)
 
 
 TAG_LIST_STYLESHEET = """
@@ -648,6 +654,7 @@ class SearchResultCard(QFrame):
         self.position_id = position_id
         self.sgf_path = sgf_path
         self.sgf_start_path = list(record.get("sgf_start_path", []) or [])
+        self.main_media_kind = record.get("main_media_kind", "board")
         self.setObjectName("searchResultCard")
         self.setFrameShape(QFrame.StyledPanel)
         if options.vertical:
@@ -782,7 +789,11 @@ class SearchResultCard(QFrame):
             layout.addLayout(body)
 
     def set_preview(self, image_path: Path | None, size: QSize) -> None:
-        if self.sgf_path is not None and self.sgf_path.exists():
+        if (
+            self.main_media_kind == "board"
+            and self.sgf_path is not None
+            and self.sgf_path.exists()
+        ):
             board = render_sgf_board(
                 self.sgf_path,
                 self.sgf_start_path,
@@ -856,6 +867,61 @@ class GalleryImageLabel(ScaledImageLabel):
             self.clicked.emit()
 
 
+class PositionImageSurface(QWidget):
+    """An editor image using exactly the same media card as the SGF board."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._source_pixmap = QPixmap()
+        self._empty_text = "No image"
+        self.setMinimumSize(300, 420)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_source_pixmap(self, pixmap: QPixmap, empty_text: str = "No image") -> None:
+        self._source_pixmap = pixmap
+        self._empty_text = empty_text
+        self.update()
+
+    def _content_rects(self) -> tuple[QRectF, QRectF, QRectF]:
+        return media_card_rects(
+            self.width(),
+            self.height(),
+            ReadOnlySgfBoard.CONTROL_PANEL_HEIGHT,
+            ReadOnlySgfBoard.OUTER_PADDING,
+        )
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#f6f2f1"))
+        outer_rect, media_rect, panel_rect = self._content_rects()
+        painter.setPen(QPen(QColor("#cfc5c8"), 1))
+        painter.setBrush(QColor("#fffdfd"))
+        painter.drawRoundedRect(outer_rect, 8, 8)
+        painter.fillRect(media_rect, QColor("#fffdfd"))
+        if self._source_pixmap.isNull():
+            painter.setPen(QColor("#665a5e"))
+            painter.drawText(media_rect, Qt.AlignCenter, self._empty_text)
+        else:
+            target_size = media_rect.size().toSize()
+            scaled = self._source_pixmap.scaled(
+                target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            target = QRect(
+                round(media_rect.center().x() - scaled.width() / 2),
+                round(media_rect.center().y() - scaled.height() / 2),
+                scaled.width(),
+                scaled.height(),
+            )
+            painter.drawPixmap(target, scaled)
+        painter.fillRect(panel_rect, QColor("#fffafa"))
+        painter.setPen(QPen(QColor("#ddd3d6"), 1))
+        painter.drawLine(panel_rect.topLeft(), panel_rect.topRight())
+        painter.drawLine(panel_rect.bottomLeft(), panel_rect.bottomRight())
+        painter.drawLine(panel_rect.topLeft(), panel_rect.bottomLeft())
+        painter.drawLine(panel_rect.topRight(), panel_rect.bottomRight())
+
+
 class PositionImageGallery(QWidget):
     image_selected = Signal(int)
 
@@ -865,21 +931,8 @@ class PositionImageGallery(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.media_stack = QStackedWidget()
         self.media_stack.setMinimumSize(300, 420)
-        self.image_label = ScaledImageLabel()
-        self.image_label.setMinimumSize(300, 360)
-        self.image_surface = QWidget()
-        image_surface_layout = QVBoxLayout(self.image_surface)
-        image_surface_layout.setContentsMargins(0, 0, 0, 0)
-        image_surface_layout.setSpacing(0)
-        image_surface_layout.addWidget(self.image_label, 1)
-        image_divider = QFrame()
-        image_divider.setFrameShape(QFrame.HLine)
-        image_divider.setStyleSheet("color: #b9cbd8; background: #b9cbd8; max-height: 1px;")
-        image_surface_layout.addWidget(image_divider)
-        image_control_space = QFrame()
-        image_control_space.setFixedHeight(ReadOnlySgfBoard.CONTROL_PANEL_HEIGHT - 1)
-        image_control_space.setStyleSheet("background: #fffafa; border: none;")
-        image_surface_layout.addWidget(image_control_space)
+        self.image_surface = PositionImageSurface()
+        self.image_label = self.image_surface
         self.sgf_board = ReadOnlySgfBoard()
         self.media_stack.addWidget(self.image_surface)
         self.media_stack.addWidget(self.sgf_board)
@@ -932,7 +985,7 @@ class PositionImageGallery(QWidget):
         self.sgf_path = sgf_path
         self.sgf_text = sgf_text
         self.board_start_paths = dict(board_start_paths or {})
-        if self.has_sgf:
+        if self.has_sgf and board_start_paths is None:
             self.board_start_paths.setdefault(0, list(sgf_start_path))
         else:
             self.sgf_board.clear()
@@ -984,6 +1037,7 @@ class PositionEditor(QWidget):
         self.clear_sgf_on_save = False
         self.main_description = ""
         self.main_score = ""
+        self.main_media_kind = "board"
         self.main_sgf_start_path: list[int] = []
         self.solution_images: list[dict[str, Any]] = []
         self.pending_solution_sources: dict[str, Path | QImage] = {}
@@ -1003,43 +1057,94 @@ class PositionEditor(QWidget):
         layout.setSpacing(8)
 
         header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        header.setAlignment(Qt.AlignVCenter)
+        board_header = QWidget()
+        board_header.setFixedHeight(46)
+        board_header.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        board_header_layout = QHBoxLayout(board_header)
+        board_header_layout.setContentsMargins(0, 0, 0, 0)
+        board_header_layout.setSpacing(8)
+        identity = QWidget(board_header)
+        identity_layout = QHBoxLayout(identity)
+        identity_layout.setContentsMargins(0, 0, 0, 0)
+        identity_layout.setSpacing(8)
         self.back_btn = QPushButton("Back to search")
-        header.addWidget(self.back_btn)
+        self.back_btn.setStyleSheet(
+            "QPushButton { min-height: 38px; max-height: 38px; padding: 0 12px; "
+            "background: #fffdfd; border: 1px solid #cfc5c8; border-radius: 8px; }"
+            "QPushButton:hover { background: #f8e8ee; border-color: #d49aad; }"
+        )
+        self.back_btn.setFixedHeight(40)
+        identity_layout.addWidget(self.back_btn)
         self.position_id_label = QLabel("")
         self.position_id_label.setStyleSheet("font-size: 18px; font-weight: 700;")
-        header.addWidget(self.position_id_label)
-        header.addStretch(1)
-        self.score_edit = QLineEdit()
+        identity_layout.addWidget(self.position_id_label)
+        self.header_identity = identity
+        board_header_layout.addWidget(identity, 0, Qt.AlignLeft | Qt.AlignVCenter)
+        board_header_layout.addStretch(1)
+        self.board_header = board_header
+
+        # Score remains part of the saved model and editor logic, but is hidden
+        # until it has a node-appropriate home in the interface.
+        self.score_edit = QLineEdit(self)
         self.score_edit.setFixedWidth(130)
         self.score_edit.setAlignment(Qt.AlignCenter)
+        self.score_edit.hide()
 
-        self.image_menu_btn = QToolButton()
-        self.image_menu_btn.setText("Image")
-        self.image_menu_btn.setPopupMode(QToolButton.InstantPopup)
-        image_menu = QMenu(self.image_menu_btn)
-        image_menu.addAction("Replace from file…", self.choose_image)
-        image_menu.addAction("Paste from clipboard", self.paste_image)
-        self.image_menu_btn.setMenu(image_menu)
+        self.solution_controls = QWidget(board_header)
+        self.solution_controls.setFixedHeight(46)
+        solution_controls_layout = QHBoxLayout(self.solution_controls)
+        solution_controls_layout.setContentsMargins(0, 3, 0, 3)
+        solution_controls_layout.setSpacing(0)
+        solution_controls_layout.setAlignment(Qt.AlignVCenter)
+        self.solution_strip = QFrame(self.solution_controls)
+        self.solution_strip.setObjectName("solutionStrip")
+        self.solution_strip.setFixedHeight(40)
+        self.solution_strip.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self.solution_strip.setStyleSheet(
+            "QFrame#solutionStrip { border: 1px solid #cfc5c8; border-radius: 7px; "
+            "background: #fffafa; }"
+        )
+        self.solution_tabs_layout = QHBoxLayout(self.solution_strip)
+        self.solution_tabs_layout.setContentsMargins(2, 2, 2, 2)
+        self.solution_tabs_layout.setSpacing(1)
+        self.solution_tabs_layout.setAlignment(Qt.AlignVCenter)
+        self.solution_tab_buttons: list[QPushButton] = []
+        self.solution_strip_slot = QWidget(self.solution_controls)
+        self.solution_strip_slot.setFixedSize(354, 40)
+        solution_strip_slot_layout = QHBoxLayout(self.solution_strip_slot)
+        solution_strip_slot_layout.setContentsMargins(0, 0, 0, 0)
+        solution_strip_slot_layout.setSpacing(0)
+        solution_strip_slot_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        solution_strip_slot_layout.addWidget(self.solution_strip)
+        solution_controls_layout.addWidget(self.solution_strip_slot)
+        solution_controls_layout.addSpacing(24)
 
-        self.solutions_menu_btn = QToolButton()
-        self.solutions_menu_btn.setText("Solutions")
-        self.solutions_menu_btn.setPopupMode(QToolButton.InstantPopup)
-        solutions_menu = QMenu(self.solutions_menu_btn)
-        solutions_menu.addAction("Add image(s)…", self.add_solution_images)
-        solutions_menu.addAction("Paste image", self.paste_solution_image)
-        solutions_menu.addAction("Add board", self.add_solution_board)
-        solutions_menu.addSeparator()
-        solutions_menu.addAction("Replace selected…", self.replace_selected_solution)
-        solutions_menu.addAction("Remove selected", self.remove_selected_solution)
-        self.solutions_menu_btn.setMenu(solutions_menu)
+        self.baseline_menu_button = QToolButton(self.solution_controls)
+        self.baseline_menu_button.setText("Set baseline")
+        self.baseline_menu_button.setPopupMode(QToolButton.InstantPopup)
+        self.baseline_menu_button.setStyleSheet(
+            "QToolButton { min-height: 38px; max-height: 38px; "
+            "border: 1px solid #a9c8dc; border-radius: 8px; "
+            "background: #edf5fa; color: #356f9f; padding: 0 10px; "
+            "font-weight: 650; }"
+            "QToolButton:hover { background: #dcecf5; border-color: #79a9c7; }"
+        )
+        self.baseline_menu_button.setFixedHeight(40)
+        solution_controls_layout.addWidget(self.baseline_menu_button)
+        solution_controls_layout.addSpacing(10)
+        self.solution_delete_button = QToolButton(self.solution_controls)
+        self.solution_delete_button.setText("Del")
+        self.solution_delete_button.setToolTip("Delete the selected solution")
+        self.solution_delete_button.setFixedSize(48, 40)
+        self.solution_delete_button.clicked.connect(self.remove_selected_solution)
+        solution_controls_layout.addWidget(self.solution_delete_button)
 
-        self.sgf_menu_btn = QToolButton()
-        self.sgf_menu_btn.setText("SGF")
-        self.sgf_menu_btn.setPopupMode(QToolButton.InstantPopup)
-        sgf_menu = QMenu(self.sgf_menu_btn)
-        sgf_menu.addAction("Attach or replace…", self.choose_sgf)
-        sgf_menu.addAction("Remove", self.mark_clear_sgf)
-        self.sgf_menu_btn.setMenu(sgf_menu)
+        self.sgf_menu_btn = QPushButton("Replace SGF")
+        self.sgf_menu_btn.setToolTip("Attach or replace the position SGF")
+        self.sgf_menu_btn.clicked.connect(self.choose_sgf)
 
         self.open_folder_btn = QToolButton()
         self.open_folder_btn.setText("Folder")
@@ -1047,16 +1152,41 @@ class PositionEditor(QWidget):
         self.delete_btn = QToolButton()
         self.delete_btn.setText("Delete")
         self.delete_btn.setToolTip("Delete this position")
-        header.addWidget(self.score_edit)
-        header.addWidget(self.image_menu_btn)
-        header.addWidget(self.solutions_menu_btn)
-        header.addWidget(self.sgf_menu_btn)
-        header.addWidget(self.open_folder_btn)
-        header.addWidget(self.delete_btn)
-        header.addSpacing(8)
+        header_action_style = (
+            "min-height: 38px; max-height: 38px; padding: 0 10px; "
+            "border: 1px solid #cfc5c8; border-radius: 8px; "
+            "background: #fffdfd; color: #4f4347; font-weight: 650;"
+        )
+        for button in (self.sgf_menu_btn, self.open_folder_btn, self.delete_btn):
+            button.setStyleSheet(
+                f"QPushButton, QToolButton {{ {header_action_style} }}"
+                "QPushButton:hover, QToolButton:hover { background: #edf5fa; "
+                "border-color: #a9c8dc; color: #356f9f; }"
+            )
+            button.setFixedSize(108, 40)
+        self.delete_btn.setStyleSheet(
+            "QToolButton { min-height: 38px; max-height: 38px; padding: 0 10px; "
+            "border: 1px solid #d5a1aa; border-radius: 8px; "
+            "background: #fff1f3; color: #8b3446; font-weight: 700; }"
+            "QToolButton:hover { background: #f6d8de; border-color: #c87687; "
+            "color: #77283a; }"
+        )
+        self.delete_btn.setFixedSize(108, 40)
+        action_header = QWidget()
+        action_header.setFixedHeight(46)
+        action_header.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        action_header_layout = QHBoxLayout(action_header)
+        action_header_layout.setContentsMargins(0, 3, 0, 3)
+        action_header_layout.setSpacing(6)
+        action_header_layout.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        action_header_layout.addStretch(1)
+        action_header_layout.addWidget(self.sgf_menu_btn)
+        action_header_layout.addWidget(self.open_folder_btn)
+        action_header_layout.addWidget(self.delete_btn)
+        header.addWidget(board_header, 5)
+        header.addWidget(action_header, 4)
         self.save_status_label = QLabel("")
         self.save_status_label.setStyleSheet("color: #5f6368;")
-        header.addWidget(self.save_status_label)
         layout.addLayout(header)
 
         self.editor_splitter = QSplitter(Qt.Horizontal)
@@ -1119,6 +1249,200 @@ class PositionEditor(QWidget):
 
         self.setEnabled(False)
 
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._position_solution_strip()
+
+    def _clear_solution_tabs(self) -> None:
+        while self.solution_tabs_layout.count():
+            item = self.solution_tabs_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+        self.solution_tab_buttons = []
+
+    def _selected_media_kind(self) -> str:
+        if self.selected_image_index == 0:
+            return self.main_media_kind
+        return self.solution_images[self.selected_image_index - 1].get("kind", "board")
+
+    def _selected_has_image(self) -> bool:
+        if self.selected_image_index == 0:
+            return not self._main_pixmap().isNull()
+        return not self._solution_pixmap(
+            self.solution_images[self.selected_image_index - 1]
+        ).isNull()
+
+    def _set_selected_media_kind(self, kind: str) -> None:
+        if kind not in {"board", "image"}:
+            return
+        if self.selected_image_index == 0:
+            self.main_media_kind = kind
+        else:
+            self.solution_images[self.selected_image_index - 1]["kind"] = kind
+        self.refresh_gallery(self.selected_image_index)
+        self.schedule_autosave()
+
+    def _rebuild_baseline_menu(self) -> None:
+        menu = QMenu(self.baseline_menu_button)
+        menu.addAction("Image from file…", self.choose_selected_image)
+        menu.addAction("Image from clipboard", self.paste_selected_image)
+        current_node_action = menu.addAction(
+            "Current SGF node", self.set_current_node_as_selected_start
+        )
+        has_sgf_node = self.image_gallery.sgf_board.current_frame is not None
+        current_node_action.setEnabled(has_sgf_node)
+        menu.addSeparator()
+        show_board = menu.addAction(
+            "Display SGF board",
+            lambda _checked=False: self._set_selected_media_kind("board"),
+        )
+        show_board.setCheckable(True)
+        show_board.setChecked(self._selected_media_kind() == "board")
+        show_board.setEnabled(
+            self._current_sgf_path() is not None or self.pending_sgf_text is not None
+        )
+        show_image = menu.addAction(
+            "Display image",
+            lambda _checked=False: self._set_selected_media_kind("image"),
+        )
+        show_image.setCheckable(True)
+        show_image.setChecked(self._selected_media_kind() == "image")
+        show_image.setEnabled(self._selected_has_image())
+        self.baseline_menu_button.setMenu(menu)
+        self.baseline_menu_button.setToolTip(
+            f"Selected baseline: {self._selected_media_kind()}"
+        )
+        # Keep this slot in the layout even on Main so selecting a solution
+        # never makes the centered header controls jump sideways.
+        is_solution = self.selected_image_index > 0
+        self.solution_delete_button.setText("Del" if is_solution else "")
+        self.solution_delete_button.setEnabled(is_solution)
+        self.solution_delete_button.setToolTip(
+            "Delete the selected solution" if is_solution else ""
+        )
+        if is_solution:
+            self.solution_delete_button.setStyleSheet(
+                "QToolButton { min-height: 38px; max-height: 38px; padding: 0 8px; "
+                "border: 1px solid #dec8ce; border-radius: 8px; "
+                "background: #fffafa; color: #704450; font-weight: 700; }"
+                "QToolButton:hover { background: #f5cfd8; border-color: #d7a4b1; }"
+            )
+        else:
+            self.solution_delete_button.setStyleSheet(
+                "QToolButton { min-height: 38px; max-height: 38px; padding: 0; "
+                "border: 1px solid transparent; background: transparent; }"
+            )
+        self.solution_delete_button.setFixedSize(48, 40)
+
+    def _position_solution_strip(self) -> None:
+        # Anchor the selector just after the position identity. Its reserved
+        # lane lets it grow only to the right without moving the baseline tools.
+        self.solution_controls.adjustSize()
+        hint = self.solution_controls.sizeHint()
+        self.solution_controls.resize(hint)
+        preferred_left = self.header_identity.geometry().right() + 28
+        self.solution_controls.move(
+            max(0, min(preferred_left, self.board_header.width() - hint.width())),
+            max(0, round((self.board_header.height() - hint.height()) / 2)),
+        )
+        self.solution_controls.raise_()
+
+    def _rebuild_solution_tabs(self) -> None:
+        self._clear_solution_tabs()
+        selected = min(self.selected_image_index, len(self.solution_images))
+        tab_count = len(self.solution_images) + 1
+        if tab_count <= 6:
+            visible_indices = list(range(tab_count))
+        elif selected <= 5:
+            visible_indices = list(range(6))
+        elif selected == tab_count - 1:
+            visible_indices = [0, 1, 2, selected - 1, selected]
+        else:
+            visible_indices = [0, 1, selected - 1, selected, selected + 1]
+        visible_indices = sorted(set(visible_indices))
+
+        previous_index = -1
+        for index in visible_indices:
+            if previous_index >= 0 and index > previous_index + 1:
+                overflow = QToolButton()
+                overflow.setText("…")
+                overflow.setPopupMode(QToolButton.InstantPopup)
+                overflow.setStyleSheet(
+                    "QToolButton { min-height: 34px; max-height: 34px; "
+                    "border: none; border-radius: 5px; "
+                    "background: transparent; color: #66545a; font-size: 14px; "
+                    "font-weight: 700; padding: 0; }"
+                    "QToolButton:hover { background: #f8e8ee; }"
+                )
+                overflow.setFixedSize(30, 34)
+                menu = QMenu(overflow)
+                for hidden_index in range(previous_index + 1, index):
+                    menu.addAction(
+                        f"Solution {hidden_index}",
+                        lambda _checked=False, tab=hidden_index: self.refresh_gallery(tab),
+                    )
+                overflow.setMenu(menu)
+                self.solution_tabs_layout.addWidget(overflow)
+            label = "Main" if index == 0 else f"S{index}"
+            button = QPushButton(label)
+            button.setMinimumWidth(52 if index == 0 else 40)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setCheckable(True)
+            button.setChecked(index == selected)
+            button.setStyleSheet(
+                "QPushButton { min-height: 34px; max-height: 34px; "
+                "border: none; border-radius: 5px; "
+                "background: transparent; color: #66545a; padding: 0 9px; "
+                "font-size: 14px; font-weight: 650; text-align: center; }"
+                "QPushButton:hover { background: #f8e8ee; }"
+                "QPushButton:checked { background: #f0d3de; color: #673548; "
+                "font-weight: 750; }"
+            )
+            button.setFixedHeight(34)
+            button.clicked.connect(lambda _checked=False, tab=index: self.refresh_gallery(tab))
+            self.solution_tabs_layout.addWidget(button)
+            self.solution_tab_buttons.append(button)
+            previous_index = index
+
+        if visible_indices and visible_indices[-1] < tab_count - 1:
+            overflow = QToolButton()
+            overflow.setText("…")
+            overflow.setPopupMode(QToolButton.InstantPopup)
+            overflow.setStyleSheet(
+                "QToolButton { min-height: 34px; max-height: 34px; "
+                "border: none; border-radius: 5px; "
+                "background: transparent; color: #66545a; font-size: 14px; "
+                "font-weight: 700; padding: 0; }"
+                "QToolButton:hover { background: #f8e8ee; }"
+            )
+            overflow.setFixedSize(30, 34)
+            menu = QMenu(overflow)
+            for hidden_index in range(visible_indices[-1] + 1, tab_count):
+                menu.addAction(
+                    f"Solution {hidden_index}",
+                    lambda _checked=False, tab=hidden_index: self.refresh_gallery(tab),
+                )
+            overflow.setMenu(menu)
+            self.solution_tabs_layout.addWidget(overflow)
+
+        add_button = QPushButton("+")
+        add_button.setFocusPolicy(Qt.NoFocus)
+        add_button.setToolTip("Add a solution")
+        add_button.setStyleSheet(
+            "QPushButton { min-height: 34px; max-height: 34px; padding: 0; "
+            "border: none; border-radius: 5px; background: #edf5fa; "
+            "color: #356f9f; font-size: 17px; font-weight: 700; }"
+            "QPushButton:hover { background: #dcecf5; }"
+        )
+        add_button.setFixedSize(30, 34)
+        add_button.clicked.connect(self.add_solution_board)
+        self.solution_tabs_layout.addWidget(add_button)
+        self._rebuild_baseline_menu()
+        QTimer.singleShot(0, self._position_solution_strip)
+
     def set_available_tags(self, tags: list[str]) -> None:
         self.tags_editor.set_available_tags(tags)
 
@@ -1148,6 +1472,8 @@ class PositionEditor(QWidget):
         index = self.selected_image_index if selected_index is None else selected_index
         images = [("Main image", self._main_pixmap())]
         board_start_paths: dict[int, list[int]] = {}
+        if self.main_media_kind == "board":
+            board_start_paths[0] = list(self.main_sgf_start_path)
         for solution_index, solution in enumerate(self.solution_images, start=1):
             score = formatted_score(solution.get("score", ""))
             prefix = "Board solution" if solution.get("kind") == "board" else "Solution"
@@ -1178,6 +1504,17 @@ class PositionEditor(QWidget):
         self.image_gallery.board_start_paths[self.selected_image_index] = list(path)
         self.schedule_autosave()
 
+    def set_current_node_as_selected_start(self) -> None:
+        frame = self.image_gallery.sgf_board.current_frame
+        if frame is None:
+            return
+        if self.selected_image_index == 0:
+            self.main_media_kind = "board"
+        else:
+            self.solution_images[self.selected_image_index - 1]["kind"] = "board"
+        self.set_selected_sgf_start_path(list(frame.node_path))
+        self.refresh_gallery(self.selected_image_index)
+
     def _current_sgf_path(self) -> Path | None:
         if self.clear_sgf_on_save:
             return None
@@ -1203,6 +1540,7 @@ class PositionEditor(QWidget):
             self.score_edit.setText(solution.get("score", ""))
         self._update_score_style()
         self._loading = False
+        self._rebuild_solution_tabs()
 
     def _on_description_changed(self) -> None:
         if self._loading:
@@ -1276,10 +1614,12 @@ class PositionEditor(QWidget):
         self.solution_images = []
         self.main_description = ""
         self.main_score = ""
+        self.main_media_kind = "board"
         self.main_sgf_start_path = []
         self.selected_image_index = 0
         self.transient_new_position = False
         self.position_id_label.clear()
+        self._position_solution_strip()
         self.score_edit.clear()
         self.description_edit.clear()
         self.tags_editor.set_tags([])
@@ -1300,6 +1640,7 @@ class PositionEditor(QWidget):
         self._loading = True
         self.current_position_id = position_id
         self.position_id_label.setText(position_id)
+        self._position_solution_strip()
         self.transient_new_position = False
         self.pending_image_path = None
         self.pending_image = None
@@ -1311,6 +1652,7 @@ class PositionEditor(QWidget):
         self.solution_images = [dict(item) for item in record.get("solution_images", [])]
         self.main_description = record.get("description", "")
         self.main_score = record.get("score", "")
+        self.main_media_kind = record.get("main_media_kind", "board")
         self.main_sgf_start_path = list(record.get("sgf_start_path", []))
         self.selected_image_index = 0
         self.tags_editor.set_tags(record.get("tags", []))
@@ -1332,8 +1674,15 @@ class PositionEditor(QWidget):
         if path:
             self.pending_image_path = Path(path)
             self.pending_image = None
+            self.main_media_kind = "image"
             self.refresh_gallery(0)
             self.schedule_autosave()
+
+    def choose_selected_image(self) -> None:
+        if self.selected_image_index == 0:
+            self.choose_image()
+        else:
+            self.replace_selected_solution()
 
     def paste_image(self) -> None:
         if not self.current_position_id:
@@ -1345,7 +1694,28 @@ class PositionEditor(QWidget):
             return
         self.pending_image = image
         self.pending_image_path = None
+        self.main_media_kind = "image"
         self.refresh_gallery(0)
+        self.schedule_autosave()
+
+    def paste_selected_image(self) -> None:
+        if self.selected_image_index == 0:
+            self.paste_image()
+            return
+        image = QApplication.clipboard().image(QClipboard.Clipboard)
+        if image.isNull():
+            QMessageBox.information(self, "Paste Solution", "Clipboard does not currently contain an image.")
+            return
+        solution = self.solution_images[self.selected_image_index - 1]
+        old_relative = solution.get("file", "")
+        if old_relative:
+            self.pending_solution_sources.pop(old_relative, None)
+            self.solution_files_to_delete.add(old_relative)
+        relative = self._next_solution_relative(".png")
+        solution["kind"] = "image"
+        solution["file"] = relative
+        self.pending_solution_sources[relative] = image
+        self.refresh_gallery(self.selected_image_index)
         self.schedule_autosave()
 
     def choose_sgf(self) -> None:
@@ -1356,6 +1726,7 @@ class PositionEditor(QWidget):
             self.pending_sgf_path = Path(path)
             self.pending_sgf_text = None
             self.clear_sgf_on_save = False
+            self.main_media_kind = "board"
             self.refresh_gallery(0)
             self.schedule_autosave()
 
@@ -1422,15 +1793,16 @@ class PositionEditor(QWidget):
         self.schedule_autosave()
 
     def add_solution_board(self) -> None:
-        if self._current_sgf_path() is None and self.pending_sgf_text is None:
-            QMessageBox.information(self, "Add Board", "Attach an SGF before adding a board solution.")
-            return
+        showing_board = (
+            self.image_gallery.media_stack.currentWidget() is self.image_gallery.sgf_board
+        )
+        frame = self.image_gallery.sgf_board.current_frame if showing_board else None
         self.solution_images.append({
             "kind": "board",
             "file": "",
             "description": "",
             "score": "",
-            "sgf_start_path": [],
+            "sgf_start_path": list(frame.node_path) if frame is not None else [],
         })
         self.refresh_gallery(len(self.solution_images))
         self.schedule_autosave()
@@ -1618,6 +1990,7 @@ class PositionEditor(QWidget):
             record = {
                 "description": self.main_description.strip(),
                 "score": main_score,
+                "main_media_kind": self.main_media_kind,
                 "sgf_start_path": list(self.main_sgf_start_path),
                 "tags": tags,
                 "metadata": self._parse_metadata(),
@@ -2227,6 +2600,7 @@ class MainWindow(QMainWindow):
 
         search_row = QHBoxLayout()
         self.query_edit = TagQueryLineEdit()
+        self.query_edit.set_boolean_query_mode()
         self.query_edit.setPlaceholderText("Search, e.g. (joseki AND reverse-sente) OR large-reverse-sente; leave blank to list all positions")
         self.query_edit.setMinimumWidth(540)
         self.query_edit.setMaximumWidth(600)
@@ -2276,6 +2650,8 @@ class MainWindow(QMainWindow):
 
         self.editor = PositionEditor(self.config)
         self.tag_manager = TagManagerPage(self.config)
+        self.statusBar().addPermanentWidget(self.editor.save_status_label)
+        self.editor.save_status_label.setEnabled(True)
         self.pages.addWidget(self.search_page)
         self.pages.addWidget(self.editor)
         self.pages.addWidget(self.tag_manager)
@@ -2459,6 +2835,7 @@ class MainWindow(QMainWindow):
             save_position(self.config, position_id, {
                 "description": "",
                 "score": "",
+                "main_media_kind": "board",
                 "sgf_start_path": [],
                 "tags": [],
                 "metadata": {},

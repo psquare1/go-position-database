@@ -11,7 +11,10 @@ import yaml
 
 from .config import Config
 
-RESERVED_POSITION_KEYS = {"description", "score", "tags", "metadata", "solution_images"}
+RESERVED_POSITION_KEYS = {
+    "description", "score", "main_media_kind", "sgf_start_path",
+    "tags", "metadata", "solution_images",
+}
 
 
 class DatabaseError(RuntimeError):
@@ -200,6 +203,7 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
     result.pop("name", None)
     result.setdefault("description", "")
     result.setdefault("score", "")
+    result.setdefault("main_media_kind", "board")
     result.setdefault("sgf_start_path", [])
     result.setdefault("tags", [])
     result.setdefault("metadata", {})
@@ -211,6 +215,8 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
         result["score"] = normalized_score
     elif not isinstance(result["score"], str):
         raise DatabaseError("Position 'score' must be a score string or a positive/negative number.")
+    if result["main_media_kind"] not in {"board", "image"}:
+        raise DatabaseError("Position 'main_media_kind' must be 'board' or 'image'.")
     result["sgf_start_path"] = normalized_sgf_start_path(
         result["sgf_start_path"], "Position 'sgf_start_path'"
     )
@@ -356,6 +362,7 @@ def create_position(
     save_position(config, position_id, {
         "description": description,
         "score": "",
+        "main_media_kind": "board",
         "sgf_start_path": [],
         "tags": list(dict.fromkeys(tags)),
         "metadata": metadata or {},

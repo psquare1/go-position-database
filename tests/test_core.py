@@ -59,6 +59,7 @@ class CoreTests(unittest.TestCase):
         q = '(joseki AND reverse-sente) OR "large reverse-sente"'
         self.assertEqual(db.search(q), ["p1", "p3"])
         self.assertEqual(db.search("joseki AND NOT reverse-sente"), ["p2"])
+        self.assertEqual(db.search("joseki and not sente"), ["p2"])
 
 
     def test_autodetect_and_clean_files(self):
@@ -96,6 +97,7 @@ class CoreTests(unittest.TestCase):
         record.update({
             "name": "Retired display name",
             "score": "B +3.5",
+            "main_media_kind": "image",
             "sgf_start_path": [0, 1],
             "solution_images": [
                 {
@@ -116,6 +118,7 @@ class CoreTests(unittest.TestCase):
         save_position(self.cfg, "p1", record)
         loaded = load_position(self.cfg, "p1")
         self.assertNotIn("name", loaded)
+        self.assertEqual(loaded["main_media_kind"], "image")
         self.assertEqual(loaded["sgf_start_path"], [0, 1])
         self.assertEqual(loaded["solution_images"][0]["score"], "W +1.5")
         self.assertEqual(loaded["solution_images"][0]["sgf_start_path"], [0, 1, 2])

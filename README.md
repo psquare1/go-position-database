@@ -132,19 +132,14 @@ rest of the collection. You can then:
 - add tags;
 - record metadata as descriptor/value pairs, such as source, game, move, player,
   difficulty, or review status;
-- enter a score for the current image;
 - add, paste, replace, and remove solution images or board instances; and
 - open the position folder when direct file access is useful.
 
-Scores accept normal Go notation, such as `B +3.5` and `W +6.5`. A raw positive
-number is interpreted as Black leading and a raw negative number as White
-leading. Press **Enter** to normalize the value and turn the score field into a
-chip. In score chips, the background matches the leading player—black for Black,
-white for White—while blue text keeps the value distinct.
-
-The editor displays one large image at a time. Use the left and right arrows to
-move between the main image and its solution images. The visible description and
-score always belong to the currently displayed image.
+The editor displays one large item at a time. Use the segmented **Main / S1 / S2**
+selector to move between the main position and its solutions. The adjacent
+**Set baseline** menu can attach an image from a file or the clipboard, store the
+current SGF node, and choose whether an item with both forms displays its image
+or its native SGF board. The visible description belongs to the selected item.
 
 When the main position has an SGF, the editor uses that same large display area
 for a native Go board instead of the static main image. The upper square contains
@@ -152,14 +147,15 @@ only the board or image; a divided rectangular toolbar sits below it. Use `<` an
 `>` for single moves, the adjacent ten-move buttons for larger jumps, and `<<`
 or `>>` for the ends of the selected line. Left/Right, Page Up/Page Down, Home,
 and End provide the same keyboard navigation. The **V ↑** and **V ↓** buttons—or
-the Up/Down keys—cycle through alternative branches. To annotate the current
-SGF node, select `123`, triangle, circle, square, or cross, then click an
-intersection. Clicking an existing annotation with its matching tool removes it.
-Number labels are assigned in order, while selecting a different markup for the
+the Up/Down keys—cycle through alternative branches. The stone and eraser tools
+play moves or edit setup stones directly. To annotate the current SGF node,
+select `1`, `A`, triangle, circle, square, or cross, then click an intersection.
+Clicking an existing annotation with its matching tool removes it. Number and
+letter labels are assigned in order, while selecting a different markup for the
 same point replaces the old one. These changes use the editor's normal autosave.
 Board coordinates appear along the top and left edges. Setup stones, passes, and
 captures are replayed. **Refresh** returns to the SGF node stored for the current
-item. Click **Set** to replace that stored node with the one currently visible.
+item; **Current SGF node** in the baseline menu replaces that stored node.
 
 The Solutions menu can add ordinary images or an **Add board** instance. A board
 instance begins at the SGF root and behaves like an independent solution view.
@@ -213,6 +209,7 @@ A typical position record looks like this:
 ```yaml
 description: White can take reverse sente before tenuki.
 score: B +3.5
+main_media_kind: board
 sgf_start_path: [0, 1]
 tags:
   - 3-3-joseki
@@ -237,6 +234,8 @@ solution_images:
 An `sgf_start_path` identifies a node by listing the child index taken at each
 branch from the SGF root. An empty list means the root node. Paths remain
 unambiguous even when separate variations contain the same move number.
+`main_media_kind` and each solution's `kind` choose whether the app displays the
+SGF board or image when both are available.
 
 The app maintains its search index automatically. On startup it also checks the
 collection and normalizes unambiguous image and SGF filenames. The generated

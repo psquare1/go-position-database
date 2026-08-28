@@ -7,7 +7,7 @@ from typing import Any
 from pysgf import GoGame, Move, ParseError
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
-from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QToolButton, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QMessageBox, QSizePolicy, QToolButton, QWidget
 
 # Board layout, expressed as multiples of one grid step. The coordinate labels sit
 # in COORD_ROOM on the top and left; a stone's outer half sits in STONE_ROOM on the
@@ -215,6 +215,30 @@ def load_sgf_text(text: str, start_path: list[int] | tuple[int, ...] = ()) -> Sg
     return _playback_from_root(GoGame.parse(text), start_path)
 
 
+def media_card_rects(
+    width: int,
+    height: int,
+    panel_height: int = 40,
+    outer_padding: int = 9,
+) -> tuple[QRectF, QRectF, QRectF]:
+    """Return the shared outer, square-media, and lower-panel rectangles."""
+    available_width = max(1, width - 72)
+    available_media_height = max(1, height - panel_height - outer_padding * 2 - 4)
+    side = float(max(1, min(available_width, available_media_height)))
+    total_height = side + panel_height
+    left = float(round((width - side) / 2))
+    top = float(round((height - total_height) / 2))
+    media_rect = QRectF(left, top, side, side)
+    panel_rect = QRectF(left, top + side, side, float(panel_height))
+    outer_rect = QRectF(
+        left - outer_padding,
+        top - outer_padding,
+        side + outer_padding * 2,
+        total_height + outer_padding * 2,
+    )
+    return outer_rect, media_rect, panel_rect
+
+
 def _grid_geometry(
     board_rect: QRectF, board_size: tuple[int, int]
 ) -> tuple[float, float, float, float, float]:
@@ -308,12 +332,14 @@ def _draw_markup(
     radius: float,
     stone_players: dict[tuple[int, int], str],
 ) -> None:
-    blue = QColor("#318fc8")
-
     def marker_pen(point: tuple[int, int]) -> QPen:
-        player = stone_players.get(point)
-        color = QColor("#b9e5ff") if player == "B" else QColor("#176a9f") if player == "W" else blue
-        return QPen(color, max(2.0, radius * 0.14), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        return QPen(
+            _annotation_color(point, stone_players),
+            max(2.0, radius * 0.14),
+            Qt.SolidLine,
+            Qt.RoundCap,
+            Qt.RoundJoin,
+        )
 
     marker_radius = radius * 0.54
     for point in frame.triangles:
@@ -347,19 +373,29 @@ def _draw_markup(
     for x, y, label in frame.labels:
         point = (x, y)
         center = _point(left, bottom, step, x, y)
-        player = stone_players.get(point)
-        painter.setPen(
-            QColor("#eef8ff") if player == "B" else QColor("#155f8c") if player == "W" else QColor("#174d6e")
-        )
+        painter.setPen(_annotation_color(point, stone_players))
         label_font = painter.font()
         label_font.setBold(True)
-        label_font.setPixelSize(max(8, int(radius * 0.76)))
+        label_font.setPixelSize(max(9, int(radius * 0.86)))
         painter.setFont(label_font)
         painter.drawText(
             QRectF(center.x() - radius, center.y() - radius, radius * 2, radius * 2),
             Qt.AlignCenter,
             label,
         )
+
+
+def _annotation_color(
+    point: tuple[int, int],
+    stone_players: dict[tuple[int, int], str],
+) -> QColor:
+    """Return the shared high-contrast blue used for every board annotation."""
+    player = stone_players.get(point)
+    if player == "B":
+        return QColor("#b9e5ff")
+    if player == "W":
+        return QColor("#176a9f")
+    return QColor("#318fc8")
 
 
 def paint_sgf_board(
@@ -429,9 +465,9 @@ def paint_sgf_board(
     if frame.last_move is not None:
         x, y = frame.last_move
         center = _point(left, bottom, step, x, y)
-        painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor("#68b7e8"), max(2.0, radius * 0.16)))
-        painter.drawEllipse(center, radius * 0.34, radius * 0.34)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(_annotation_color((x, y), stone_players))
+        painter.drawEllipse(center, radius * 0.18, radius * 0.18)
 
     _draw_markup(painter, frame, left, bottom, step, radius, stone_players)
 
@@ -468,6 +504,87 @@ def render_sgf_board(
     return pixmap
 
 
+class StoneModeButton(QToolButton):
+    """Compact, font-independent stone icon used by the board editing modes."""
+
+    def __init__(self, mode: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.mode = mode
+        self.player = "B"
+        self.setAccessibleName({
+            "play": "Play moves",
+            "black": "Place black setup stones",
+            "white": "Place white setup stones",
+        }[mode])
+
+    def set_player(self, player: str) -> None:
+        normalized = "W" if player == "W" else "B"
+        if normalized != self.player:
+            self.player = normalized
+            self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        diameter = max(10.0, min(self.width(), self.height()) * 0.48)
+        stone = QRectF(
+            (self.width() - diameter) / 2,
+            (self.height() - diameter) / 2,
+            diameter,
+            diameter,
+        )
+        black = QColor("#2a2929" if self.isEnabled() else "#aaa3a5")
+        white = QColor("#f5f3ef" if self.isEnabled() else "#e3dfe0")
+        outline = QColor("#655b5e" if self.isEnabled() else "#bdb5b7")
+        painter.setPen(QPen(outline, 1.1))
+        if self.mode == "black":
+            painter.setBrush(black)
+            painter.drawEllipse(stone)
+        elif self.mode == "white":
+            painter.setBrush(white)
+            painter.drawEllipse(stone)
+        else:
+            painter.setBrush(white)
+            painter.drawEllipse(stone)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(black)
+            # Black occupies the leading half, making the side to play obvious.
+            start_angle = 90 * 16 if self.player == "B" else -90 * 16
+            painter.drawPie(stone, start_angle, 180 * 16)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(outline, 1.1))
+            painter.drawEllipse(stone)
+
+
+class EraserModeButton(QToolButton):
+    """Draw a small eraser rather than relying on a backspace font glyph."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setAccessibleName("Erase stones")
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        center = QPointF(self.width() / 2, self.height() / 2)
+        scale = min(self.width(), self.height()) / 32.0
+        body = QPolygonF([
+            center + QPointF(-7 * scale, 2 * scale),
+            center + QPointF(-1 * scale, -6 * scale),
+            center + QPointF(8 * scale, 1 * scale),
+            center + QPointF(2 * scale, 8 * scale),
+        ])
+        painter.setPen(QPen(QColor("#74656a"), max(1.0, scale)))
+        painter.setBrush(QColor("#e7a9bc" if self.isEnabled() else "#d5cbce"))
+        painter.drawPolygon(body)
+        painter.drawLine(
+            center + QPointF(-3 * scale, -3 * scale),
+            center + QPointF(5 * scale, 4 * scale),
+        )
+
+
 class ReadOnlySgfBoard(QWidget):
     """A native Qt board with tree navigation and editable SGF markup."""
 
@@ -485,6 +602,7 @@ class ReadOnlySgfBoard(QWidget):
         self.error_message = ""
         self.saved_start_path: tuple[int, ...] = ()
         self.annotation_tool: str | None = None
+        self.edit_tool = "play"
         self.setMinimumSize(300, 420)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -511,8 +629,6 @@ class ReadOnlySgfBoard(QWidget):
         self.forward_ten_button.setText(">₁₀")
         self.last_button = QToolButton()
         self.last_button.setText(">>")
-        self.set_start_button = QToolButton()
-        self.set_start_button.setText("Set")
         self.refresh_button = QToolButton()
         self.refresh_button.setText("↻")
         self.delete_node_button = QToolButton()
@@ -523,9 +639,24 @@ class ReadOnlySgfBoard(QWidget):
         self.variation_next_button = QToolButton()
         self.variation_next_button.setText("V ↓")
 
+        self.edit_mode_buttons: dict[str, QToolButton] = {}
+        for key, button in (
+            ("play", StoneModeButton("play")),
+            ("black_setup", StoneModeButton("black")),
+            ("white_setup", StoneModeButton("white")),
+            ("erase", EraserModeButton()),
+        ):
+            button.setCheckable(True)
+            button.setChecked(key == "play")
+            button.clicked.connect(
+                lambda checked, name=key: self._select_board_tool(name, checked)
+            )
+            self.edit_mode_buttons[key] = button
+
         self.annotation_buttons: dict[str, QToolButton] = {}
         for key, text_value, tooltip in (
-            ("numbers", "123", "Add or remove a numbered label"),
+            ("numbers", "1", "Add or remove a numbered label"),
+            ("letters", "A", "Add or remove an alphabetic label"),
             ("triangles", "△", "Add or remove a triangle"),
             ("circles", "○", "Add or remove a circle"),
             ("squares", "□", "Add or remove a square"),
@@ -539,26 +670,50 @@ class ReadOnlySgfBoard(QWidget):
             button.clicked.connect(lambda checked, name=key: self._select_annotation_tool(name, checked))
             self.annotation_buttons[key] = button
 
-        control_buttons = [
+        navigation_buttons = [
             self.first_button, self.back_ten_button, self.previous_button,
             self.next_button, self.forward_ten_button, self.last_button,
-            self.variation_previous_button, self.variation_next_button,
-            *self.annotation_buttons.values(), self.delete_node_button,
-            self.refresh_button, self.set_start_button,
         ]
-        for button in control_buttons:
+        variation_buttons = [self.variation_previous_button, self.variation_next_button]
+        position_buttons = list(self.edit_mode_buttons.values())
+        annotation_buttons = list(self.annotation_buttons.values())
+        grouped_buttons = (
+            (position_buttons, "#fffafa"),
+            (variation_buttons, "#f4f7fa"),
+            (navigation_buttons, "#fffdfd"),
+            (annotation_buttons, "#fbf0f4"),
+            ([self.delete_node_button], "#fbf3f3"),
+            ([self.refresh_button], "#edf5fa"),
+        )
+        for group_index, (buttons, background) in enumerate(grouped_buttons):
+            for index, button in enumerate(buttons):
+                # The panel frame supplies its outside edges. Between groups, the
+                # incoming group supplies one separator and the outgoing group
+                # omits its right edge, preventing doubled or offset lines.
+                left_border = (
+                    "2px solid #9fc2d8"
+                    if group_index > 0 and index == 0 else "none"
+                )
+                right_border = "1px solid #ddd3d6" if index < len(buttons) - 1 else "none"
+                button.setStyleSheet(
+                    "QToolButton { color: #55464c; border: none; "
+                    f"border-left: {left_border}; border-right: {right_border}; "
+                    "border-bottom: 1px solid #ddd3d6; border-radius: 0; "
+                    f"background: {background}; padding: 0 2px; font-size: 15px; "
+                    "font-weight: 700; }"
+                    "QToolButton:hover { background: #e6f1f7; color: #356f9f; }"
+                    "QToolButton:checked { background: #efd2dd; color: #673548; }"
+                    "QToolButton:disabled { color: #b8adb1; background: #f8f4f5; }"
+                )
+
+        for button in (
+            *navigation_buttons, *variation_buttons, *position_buttons,
+            *annotation_buttons, self.delete_node_button, self.refresh_button,
+        ):
             button.setToolTip("")
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             button.setMinimumWidth(29)
             button.setAutoRaise(False)
-            button.setStyleSheet(
-                "QToolButton { color: #55464c; border: none; border-right: 1px solid #ddd3d6; "
-                "border-bottom: 1px solid #ddd3d6; border-radius: 0; background: #fffafa; "
-                "padding: 0 2px; font-size: 15px; font-weight: 700; }"
-                "QToolButton:hover { background: #edf5fa; color: #356f9f; }"
-                "QToolButton:checked { background: #f0d3de; color: #673548; }"
-                "QToolButton:disabled { color: #b8adb1; background: #f8f4f5; }"
-            )
 
         for key in ("squares", "crosses"):
             button = self.annotation_buttons[key]
@@ -566,23 +721,22 @@ class ReadOnlySgfBoard(QWidget):
         self.refresh_button.setStyleSheet(
             self.refresh_button.styleSheet() + "QToolButton { font-size: 18px; }"
         )
-        self.first_button.setStyleSheet(
-            self.first_button.styleSheet() + "QToolButton { border-left: 1px solid #ddd3d6; }"
-        )
-
+        # Position editing and variation selection lead into the centrally placed
+        # game navigation group; annotations and destructive actions follow it.
+        for button in self.edit_mode_buttons.values():
+            controls_layout.addWidget(button)
+        controls_layout.addWidget(self.variation_previous_button)
+        controls_layout.addWidget(self.variation_next_button)
         controls_layout.addWidget(self.first_button)
         controls_layout.addWidget(self.back_ten_button)
         controls_layout.addWidget(self.previous_button)
         controls_layout.addWidget(self.next_button)
         controls_layout.addWidget(self.forward_ten_button)
         controls_layout.addWidget(self.last_button)
-        controls_layout.addWidget(self.variation_previous_button)
-        controls_layout.addWidget(self.variation_next_button)
         for button in self.annotation_buttons.values():
             controls_layout.addWidget(button)
         controls_layout.addWidget(self.delete_node_button)
         controls_layout.addWidget(self.refresh_button)
-        controls_layout.addWidget(self.set_start_button)
 
         self.controls.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -594,8 +748,8 @@ class ReadOnlySgfBoard(QWidget):
         self.last_button.clicked.connect(self.go_to_last)
         self.variation_previous_button.clicked.connect(lambda: self.change_variation(-1))
         self.variation_next_button.clicked.connect(lambda: self.change_variation(1))
+        self.delete_node_button.clicked.connect(self.delete_current_node)
         self.refresh_button.clicked.connect(self.refresh_start)
-        self.set_start_button.clicked.connect(self._request_current_start)
         self._update_controls()
         self._position_controls()
 
@@ -637,19 +791,36 @@ class ReadOnlySgfBoard(QWidget):
         self.saved_start_path = ()
         self.frame_index = 0
         self.active_line_paths = []
-        self._select_annotation_tool(None, False)
+        self._activate_board_tool("play")
         self._update_controls()
         self.update()
 
     def _select_annotation_tool(self, tool: str | None, checked: bool) -> None:
-        self.annotation_tool = tool if tool is not None and checked else None
-        for name, button in self.annotation_buttons.items():
-            should_be_checked = name == self.annotation_tool
+        self._activate_board_tool(tool if tool is not None and checked else "play")
+
+    def _select_board_tool(self, tool: str, checked: bool) -> None:
+        if tool == "play" and self.edit_tool == "play" and not checked:
+            self._toggle_player_to_move()
+            self._activate_board_tool("play")
+            return
+        self._activate_board_tool(tool)
+
+    def _activate_board_tool(self, tool: str) -> None:
+        self.edit_tool = tool
+        self.annotation_tool = tool if tool in self.annotation_buttons else None
+        for name, button in self.edit_mode_buttons.items():
+            should_be_checked = name == tool
             if button.isChecked() != should_be_checked:
                 button.blockSignals(True)
                 button.setChecked(should_be_checked)
                 button.blockSignals(False)
-        self.setCursor(Qt.CrossCursor if self.annotation_tool else Qt.ArrowCursor)
+        for name, button in self.annotation_buttons.items():
+            should_be_checked = name == tool
+            if button.isChecked() != should_be_checked:
+                button.blockSignals(True)
+                button.setChecked(should_be_checked)
+                button.blockSignals(False)
+        self.setCursor(Qt.CrossCursor)
         self.update()
 
     def _node_at_path(self, path: tuple[int, ...]):
@@ -692,7 +863,7 @@ class ReadOnlySgfBoard(QWidget):
                 for item in sorted(points)
             ])
 
-        if self.annotation_tool == "numbers":
+        if self.annotation_tool in {"numbers", "letters"}:
             labels = list(node.get_list_property("LB", []))
             matching = [value for value in labels if value.split(":", 1)[0] == coordinate]
             if matching:
@@ -703,15 +874,28 @@ class ReadOnlySgfBoard(QWidget):
                     points = shape_points(prop)
                     points.discard(point)
                     store_shape_points(prop, points)
-                used_numbers = {
-                    int(value.split(":", 1)[1])
-                    for value in labels
-                    if ":" in value and value.split(":", 1)[1].isdigit()
-                }
-                number = 1
-                while number in used_numbers:
-                    number += 1
-                labels.append(f"{coordinate}:{number}")
+                if self.annotation_tool == "numbers":
+                    used_numbers = {
+                        int(value.split(":", 1)[1])
+                        for value in labels
+                        if ":" in value and value.split(":", 1)[1].isdigit()
+                    }
+                    number = 1
+                    while number in used_numbers:
+                        number += 1
+                    label = str(number)
+                else:
+                    used_letters = {
+                        value.split(":", 1)[1].upper()
+                        for value in labels
+                        if ":" in value and value.split(":", 1)[1].isalpha()
+                    }
+                    label_index = 0
+                    label = self._alphabetic_label(label_index)
+                    while label in used_letters:
+                        label_index += 1
+                        label = self._alphabetic_label(label_index)
+                labels.append(f"{coordinate}:{label}")
                 self._replace_property(node, "LB", labels)
         else:
             selected_property = property_for_tool[self.annotation_tool]
@@ -737,6 +921,150 @@ class ReadOnlySgfBoard(QWidget):
         self._update_controls()
         self.update()
         self.sgf_edited.emit(serialized)
+
+    @staticmethod
+    def _alphabetic_label(index: int) -> str:
+        """Return A..Z, AA..AZ, BA... for annotation labels."""
+        result = ""
+        value = index + 1
+        while value:
+            value, remainder = divmod(value - 1, 26)
+            result = chr(ord("A") + remainder) + result
+        return result
+
+    def _current_player_to_move(self) -> str:
+        node = self._node_at_path(self.current_frame.node_path) if self.current_frame else None
+        player = str(node.next_player).upper() if node is not None else "B"
+        return player if player in {"B", "W"} else "B"
+
+    def _commit_tree_edit(self, path: tuple[int, ...]) -> None:
+        if not self.playback:
+            return
+        serialized = self.playback.root.sgf()
+        self.playback = _playback_from_root(self.playback.root, path)
+        self._select_path(path)
+        self._update_controls()
+        self.update()
+        self.sgf_edited.emit(serialized)
+        if self.active_line_paths:
+            self.frame_changed.emit(self.frame_index, len(self.active_line_paths))
+
+    def _toggle_player_to_move(self) -> None:
+        if not self.playback or not self.current_frame:
+            return
+        node = self._node_at_path(self.current_frame.node_path)
+        if node is None:
+            return
+        player = "W" if self._current_player_to_move() == "B" else "B"
+        node.set_property("PL", player)
+        self._commit_tree_edit(self.current_frame.node_path)
+
+    def _store_setup_points(self, node, prop: str, points: set[tuple[int, int]]) -> None:
+        if not self.playback:
+            return
+        values = [
+            Move(coords=point).sgf(board_size=self.playback.board_size)
+            for point in sorted(points)
+        ]
+        self._replace_property(node, prop, values)
+
+    def _edit_board_point(self, point: tuple[int, int]) -> None:
+        if not self.playback or not self.current_frame:
+            return
+        node = self._node_at_path(self.current_frame.node_path)
+        if node is None:
+            return
+        current_path = self.current_frame.node_path
+        if self.edit_tool == "play":
+            occupied = {(x, y) for x, y, _player, _number in self.current_frame.stones}
+            if point in occupied:
+                return
+            player = self._current_player_to_move()
+            trial_board = {
+                (x, y): (stone_player, move_number)
+                for x, y, stone_player, move_number in self.current_frame.stones
+            }
+            _play_move(
+                trial_board,
+                point,
+                player,
+                self.current_frame.move_number + 1,
+                self.playback.board_size,
+            )
+            if point not in trial_board:  # Suicide is never stored as an SGF move.
+                return
+            if current_path:
+                previous_frame = self.playback.frames_by_path.get(current_path[:-1])
+                if previous_frame is not None:
+                    previous_position = {
+                        (x, y): stone_player
+                        for x, y, stone_player, _number in previous_frame.stones
+                    }
+                    trial_position = {
+                        location: stone[0] for location, stone in trial_board.items()
+                    }
+                    if trial_position == previous_position:  # Simple-ko repetition.
+                        return
+            child = node.play(Move(player=player, coords=point))
+            child_index = next(
+                index for index, candidate in enumerate(node.ordered_children)
+                if candidate is child
+            )
+            self._commit_tree_edit(current_path + (child_index,))
+            return
+
+        # SGF setup properties describe a position rather than a played move. If
+        # the displayed node contains a move, append a setup node instead of
+        # producing a node that mixes the two concepts.
+        if node.moves:
+            parent = node
+            node = type(node)(parent=parent)
+            child_index = next(
+                index for index, candidate in enumerate(parent.ordered_children)
+                if candidate is node
+            )
+            current_path = current_path + (child_index,)
+
+        setup_properties = {
+            prop: _expanded_points(node.get_list_property(prop, []), self.playback.board_size)
+            for prop in ("AB", "AW", "AE")
+        }
+        for points in setup_properties.values():
+            points.discard(point)
+        if self.edit_tool == "black_setup":
+            setup_properties["AB"].add(point)
+        elif self.edit_tool == "white_setup":
+            setup_properties["AW"].add(point)
+        elif self.edit_tool == "erase":
+            setup_properties["AE"].add(point)
+        else:
+            return
+        for prop, points in setup_properties.items():
+            self._store_setup_points(node, prop, points)
+        self._commit_tree_edit(current_path)
+
+    def delete_current_node(self, *, confirm: bool = True) -> None:
+        if not self.playback or not self.current_frame or not self.current_frame.node_path:
+            return
+        if confirm and QMessageBox.warning(
+            self,
+            "Delete SGF Node",
+            "Delete this SGF node and every continuation beneath it?",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        path = self.current_frame.node_path
+        parent_path = path[:-1]
+        parent = self._node_at_path(parent_path)
+        if parent is None or path[-1] >= len(parent.ordered_children):
+            return
+        target = parent.ordered_children[path[-1]]
+        parent.children.remove(target)
+        if self.saved_start_path[:len(path)] == path:
+            self.saved_start_path = parent_path
+            self.start_requested.emit(list(parent_path))
+        self._commit_tree_edit(parent_path)
 
     @property
     def current_frame(self) -> SgfFrame | None:
@@ -808,7 +1136,7 @@ class ReadOnlySgfBoard(QWidget):
         self.update()
         self.frame_changed.emit(self.frame_index, len(self.active_line_paths))
 
-    def _request_current_start(self) -> None:
+    def request_current_start(self) -> None:
         frame = self.current_frame
         if frame is None:
             return
@@ -825,21 +1153,19 @@ class ReadOnlySgfBoard(QWidget):
         self.forward_ten_button.setEnabled(frame_count > 0 and self.frame_index < frame_count - 1)
         self.first_button.setEnabled(frame_count > 0 and self.frame_index > 0)
         self.last_button.setEnabled(frame_count > 0 and self.frame_index < frame_count - 1)
-        self.set_start_button.setEnabled(frame is not None)
+        self.delete_node_button.setEnabled(frame is not None and bool(frame.node_path))
         self.refresh_button.setEnabled(frame is not None)
+        for button in (*self.edit_mode_buttons.values(), *self.annotation_buttons.values()):
+            button.setEnabled(frame is not None)
         variation = self._variation_context()
         has_variation = variation is not None
         self.variation_previous_button.setEnabled(has_variation)
         self.variation_next_button.setEnabled(has_variation)
-        if frame and self.playback:
-            self.set_start_button.setText("Set ✓" if frame.node_path == self.saved_start_path else "Set")
-            self.setToolTip("")
-        elif self.error_message:
-            self.set_start_button.setText("Set")
-            self.setToolTip(self.error_message)
-        else:
-            self.set_start_button.setText("Set")
-            self.setToolTip("")
+        player = self._current_player_to_move() if frame and self.playback else "B"
+        play_button = self.edit_mode_buttons["play"]
+        if isinstance(play_button, StoneModeButton):
+            play_button.set_player(player)
+        self.setToolTip(self.error_message if self.error_message else "")
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if event.key() == Qt.Key_Left:
@@ -877,24 +1203,9 @@ class ReadOnlySgfBoard(QWidget):
         super().keyPressEvent(event)
 
     def _content_rects(self) -> tuple[QRectF, QRectF, QRectF]:
-        available_width = max(1, self.width() - 72)
-        available_board_height = max(
-            1,
-            self.height() - self.CONTROL_PANEL_HEIGHT - self.OUTER_PADDING * 2 - 4,
+        return media_card_rects(
+            self.width(), self.height(), self.CONTROL_PANEL_HEIGHT, self.OUTER_PADDING
         )
-        side = float(max(1, min(available_width, available_board_height)))
-        total_height = side + self.CONTROL_PANEL_HEIGHT
-        left = float(round((self.width() - side) / 2))
-        top = float(round((self.height() - total_height) / 2))
-        board_rect = QRectF(left, top, side, side)
-        panel_rect = QRectF(left, top + side, side, float(self.CONTROL_PANEL_HEIGHT))
-        outer_rect = QRectF(
-            left - self.OUTER_PADDING,
-            top - self.OUTER_PADDING,
-            side + self.OUTER_PADDING * 2,
-            total_height + self.OUTER_PADDING * 2,
-        )
-        return outer_rect, board_rect, panel_rect
 
     def _position_controls(self) -> None:
         _, _, panel_rect = self._content_rects()
@@ -918,7 +1229,7 @@ class ReadOnlySgfBoard(QWidget):
         return board_rect, left, right, top, bottom, step
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() == Qt.LeftButton and self.annotation_tool and self.playback:
+        if event.button() == Qt.LeftButton and self.playback:
             geometry = self._board_geometry()
             if geometry is not None:
                 _, left, _, _, bottom, step = geometry
@@ -931,7 +1242,10 @@ class ReadOnlySgfBoard(QWidget):
                     and abs(event.position().y() - center.y()) <= step * 0.48
                 )
                 if 0 <= x < width and 0 <= y < height and close_enough:
-                    self._toggle_annotation((x, y))
+                    if self.annotation_tool:
+                        self._toggle_annotation((x, y))
+                    else:
+                        self._edit_board_point((x, y))
                     event.accept()
                     return
         super().mousePressEvent(event)
