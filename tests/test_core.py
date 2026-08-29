@@ -76,15 +76,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(position_sgf_path(self.cfg, "p1").name, "position.sgf")
         self.assertEqual(position_image_path(self.cfg, "p1").name, "position.jpg")
 
-    def test_sgf_optional_but_image_required(self):
+    def test_main_media_can_be_an_image_or_sgf(self):
         d = self.cfg.positions_dir / "p2"
         (d / self.cfg.sgf_filename).unlink()
         db = GoPositionDatabase(self.cfg)
-        self.assertFalse(any("p2: missing" in error and "SGF" in error for error in db.check()))
+        self.assertFalse(any("p2: missing main image or SGF" in error for error in db.check()))
 
         (d / self.cfg.image_filename).unlink()
         errors = db.check()
-        self.assertTrue(any("p2: missing image" in error for error in errors))
+        self.assertTrue(any("p2: missing main image or SGF" in error for error in errors))
 
     def test_cycle_detection(self):
         from go_position_db.storage import DatabaseError

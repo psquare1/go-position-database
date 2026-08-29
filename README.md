@@ -1,41 +1,37 @@
 # Go Position DB
 
-Go Position Database is a desktop library for collecting, annotating, organizing, 
-and searching Go positions. Its flexible tagging and Boolean search make it easy 
-to rediscover a specific position from only a vague memory, compare recurring 
-shapes across different games, and recognize patterns in how similar positions are 
-played.
+Go Position Database is a desktop library for collecting, studying, organizing,
+and searching Go positions. SGF is the preferred format when available because
+it preserves an editable game tree, while images remain fully supported for
+screenshots, diagrams, and sources without an SGF. Either form—or both together—
+can be combined with descriptions, scores, metadata, solutions, and hierarchical
+tags so that useful positions remain easy to find.
 
-The PySide6 app is the primary interface. It provides a visual browser for the
-collection, a board-focused editor for individual positions, and a tag manager
-for classifying positions using a customizable vocabulary.
+The PySide6 desktop app is the primary interface. It includes a visual browser,
+a position and SGF editor, and a tag manager.
 
 ## What you can do
 
-- Build a personal database of Go positions from screenshots or other board images.
-- Keep an optional SGF with each position.
-- Open attached SGFs as native, scalable Go boards, step through moves, explore
-  variations, and add standard point annotations directly on the board.
-- Add a description, score, structured metadata, and any number of explicit tags.
-- Attach multiple solution images or SGF-backed board instances to explain
-  variations and alternative lines. Every solution can have its own description
-  and score.
+- Build a personal collection from existing SGFs, new blank SGFs, screenshots,
+  or pasted board images.
+- View and edit SGFs on a scalable native Go board, including moves, branches,
+  setup stones, passes, and common point annotations.
+- Add image-based or SGF-based solutions and variations, each with its own
+  description and score.
+- Describe positions with free-form notes, scores, structured metadata, and any
+  number of tags.
 - Organize tags into parent/child hierarchies. A position tagged
-  `3-3-joseki`, for example, can also appear in a search for its parent tag
-  `joseki` without storing both tags on the position.
-- Search with Boolean expressions such as `joseki AND NOT ko`, including `AND`,
-  `OR`, `NOT`, parentheses, and autocomplete.
-- Paste images directly from the clipboard when capturing a position is faster
-  than saving it first.
-- Keep the complete collection in ordinary folders that are easy to inspect,
-  manually open SGFs with, copy, synchronize, or back up with Git.
+  `3-3-joseki`, for example, also appears in a search for `joseki`.
+- Search with Boolean expressions such as `joseki AND NOT ko`.
+- Keep the collection in ordinary folders that can be inspected, synchronized,
+  backed up, or versioned independently of the app.
 
 ## Quick start on Windows
 
-You need [Python 3](https://www.python.org/downloads/) installed. When installing
-Python, enable the option that adds it to `PATH`.
+Install [Python 3](https://www.python.org/downloads/) and enable the installer
+option that adds Python to `PATH`.
 
-1. Download the repository from GitHub using **Code → Download ZIP**, or clone it:
+1. Download the repository using **Code → Download ZIP**, or clone it:
 
    ```powershell
    git clone <repository-url>
@@ -44,17 +40,13 @@ Python, enable the option that adds it to `PATH`.
 
 2. Double-click `launch_gui.bat`.
 
-The launcher handles the rest. It creates a private `.venv`, installs PySide6 and
-the other required packages, initializes an empty database on first launch, and
-opens the app. Running the same file later checks the dependencies and launches
-the existing collection; it does not overwrite it.
-
-The downloaded repository contains no positions. Your `positions`, `tags.yaml`,
-`config.yaml`, and generated index are created on your machine.
+The launcher creates a private Python environment, installs the required
+packages, initializes an empty collection on first launch, and opens the app.
+Later launches reuse the same environment and collection.
 
 ### Manual installation
 
-For a manual or non-Windows setup, run these commands from the repository folder:
+For a manual or non-Windows setup:
 
 ```powershell
 python -m venv .venv
@@ -80,208 +72,135 @@ python go_db.py --root . init
 python go_db.py --root . gui
 ```
 
-The `--root` option chooses where the position collection is stored. Omit it to
-use the repository folder, or point it at a separate folder if you prefer to keep
-your collection away from the application code.
+`--root` selects the folder containing the collection. Omit it to use the
+repository folder, or point it to a separate folder to keep personal data apart
+from the application code.
 
-## Using the desktop app
+## Core workflow
 
-The top navigation separates the three main tasks: **Browse positions**,
-**New position**, and **Manage tags**.
+The app is organized around **Browse positions**, **New position**, and
+**Manage tags**.
+
+### Create and edit positions
+
+A main position can start from an SGF, an image, or both. SGFs provide the
+richest editing and study experience, while images are useful when only a visual
+reference is available:
+
+- SGFs can be loaded from a file or created as a blank 19×19 game.
+- Images can be chosen from a file or pasted from the clipboard.
+- When both forms exist, the position can be viewed as either the image or the
+  native SGF board.
+
+The editor also stores a description, score, metadata, and tags. Changes save
+automatically. Open any result from the browser to return to the same editor.
+
+### Work with SGFs
+
+The native board can navigate and edit the SGF game tree. It supports ordinary
+moves and passes, setup stones, erasing stones, branches, and numbered, letter,
+triangle, circle, square, and cross annotations. A position can use any node in
+the SGF as its starting view, which is useful when the full game provides context
+but only a later position is relevant.
+
+### Add solutions and variations
+
+A position can have multiple solutions. SGF board views are especially useful
+for interactive variations, while images can preserve external diagrams or
+analysis. A solution may be:
+
+- an image loaded from a file or pasted from the clipboard; or
+- a board view backed by the position's SGF.
+
+A new board solution starts at the SGF node currently being viewed, or at the
+root when no board node is active. Its starting node can be changed later. This
+makes it possible to present several branches of one SGF as separate named
+solutions without duplicating the game file.
+
+The main position and every solution can carry its own description and score.
+
+### Organize with tags
+
+Tags provide the main vocabulary for classifying the collection. They can have
+descriptions and multiple parents, allowing broad categories and more specific
+subcategories to coexist. Cycles are rejected, and redundant ancestor tags are
+cleaned up automatically when tags or their hierarchy change.
+
+For example, a position explicitly tagged `3-3-joseki` can be found through
+either `3-3-joseki` or its parent `joseki`.
 
 ### Browse and search
 
-Leave the query empty to see the whole collection, or combine tags in a Boolean
-query:
+Leave the query empty to browse the whole collection, or combine tags with
+`AND`, `OR`, `NOT`, and parentheses:
 
 ```text
 joseki
 joseki AND reverse-sente
 (joseki OR tesuji) AND NOT ko
-NOT whole-board
 ```
 
-Searches for a parent tag include positions using its descendants. Tag names
-autocomplete inside complete Boolean expressions; press **Tab** to accept a
-suggestion. Tags are normalized to lowercase with hyphens, so `Reverse Sente`
-and `reverse_sente` become `reverse-sente`. `and`, `or`, and `not` are reserved
-for queries and cannot be tag names.
-
-Choose a result layout according to how much context you need:
-
-- **Compact** shows images only, four per row.
-- **Standard** shows images, filenames, and tags, three per row.
-- **Detailed** adds the score, description, and metadata.
-
-When a position has an attached SGF, its result shows a small read-only board
-rendered at the stored start node instead of the main image.
-
-Click a result's board or image, or double-click the result, to open the full
-position editor.
-
-### Create and edit positions
-
-Choose **New position** to open a blank position in the same editor used for the
-rest of the collection. You can then:
-
-- choose, replace, or paste the main board image;
-- create a blank 19×19 SGF, or attach, replace, or remove an SGF;
-- view an attached SGF directly on the large board surface, move through its
-  game tree, and inspect its labels and shape annotations;
-- write a description;
-- add tags, with confirmation before a previously unknown tag is created;
-- record metadata as descriptor/value pairs, such as source, game, move, player,
-  difficulty, or review status;
-- add, paste, replace, and remove solution images or board instances; and
-- open the position folder when direct file access is useful.
-
-The editor displays one large item at a time. Use the segmented **Main / S1 / S2**
-selector to move between the main position and its solutions, or press
-**Ctrl+Left** / **Ctrl+Right** to select the previous or next item while focus is
-outside a text box. The
-**Set baseline** menu to its left can attach an image from a file or the
-clipboard, store the current SGF node, choose whether an item with both forms
-displays its image or its native SGF board, and delete the selected solution.
-The red **Del** entry removes only the currently selected solution after a
-confirmation; it never deletes the main position. The visible description
-belongs to the selected item.
-
-The header **SGF** menu can choose an SGF from a file, create a blank SGF, or
-remove the current SGF. When no SGF exists, **Create new SGF** takes the place of
-**Current SGF node** in the baseline menu.
-
-When the main position has an SGF, the editor uses that same large display area
-for a native Go board instead of the static main image. The upper square contains
-only the board or image; a divided rectangular toolbar sits below it. Use `<` and
-`>` for single moves, the adjacent ten-move buttons for larger jumps, and `<<`
-or `>>` for the ends of the selected line. Left/Right, Page Up/Page Down, Home,
-and End provide the same keyboard navigation. The **V ↑** and **V ↓** buttons—or
-the Up/Down keys—cycle through alternative branches. The stone and eraser tools
-play moves or edit setup stones directly; `P` plays a pass for the current player.
-To annotate the current SGF node,
-select `1`, `A`, triangle, circle, square, or cross, then click an intersection.
-Clicking an existing annotation with its matching tool removes it. Number and
-letter labels are assigned in order, while selecting a different markup for the
-same point replaces the old one. These changes use the editor's normal autosave.
-On empty intersections, a small section of the crossing grid lines is faded so
-the annotation remains clear without covering or recoloring the board surface.
-Hovering an intersection previews the selected annotation at reduced opacity or
-the stone that would be played or placed there without changing the normal mouse pointer. A
-matching annotation remains visible rather than previewing its removal. Play-tool
-hover is only a translucent stone overlay on an empty intersection; captures and
-move legality are still evaluated when the board is clicked. The last-move dot is
-hidden when that stone is annotated, erased, or followed by setup-stone additions.
-Board coordinates appear along the top and left edges. Setup stones, passes, and
-captures are replayed. **Refresh** returns to the SGF node stored for the current
-item; **Current SGF node** in the baseline menu replaces that stored node.
-
-The Solutions menu can add ordinary images or an **Add board** instance. A board
-instance begins at the SGF root and behaves like an independent solution view.
-Navigate to the desired node and click **Set** to store its opening point. Solution
-images and boards remain available through the segmented selector.
-
-Changes save automatically after a short pause. They are also flushed when you
-return to Browse or close the app. Deleting
-a populated position always requires confirmation.
-
-### Tag system
-
-Choose **Manage tags** to create and maintain the vocabulary used to organize the
-collection.
-
-- Type a new tag name and press **Enter** to create and select it.
-- Type an existing name and press **Enter** to select it.
-- Press **Tab** to accept autocomplete.
-- Optionally, add a description explaining how the tag should be used; descriptions save
-  automatically.
-- Add or remove parents and children. Editing either side keeps the reverse
-  relationship synchronized.
-- See how many positions match a tag through inheritance and how many use it
-  directly.
-
-A tag can have more than one parent, while cycles are rejected. When tagging a
-position, the app avoids redundant ancestors: adding a more specific descendant
-removes its explicitly stored ancestor. Changing the hierarchy performs the same
-cleanup across existing positions, including redundancies introduced through an
-indirect ancestor chain. Startup/index maintenance also repairs stale or imported
-records containing unknown, duplicate, or implied ancestor tags.
+Search includes tag inheritance, so a query for a parent tag also finds
+positions using its descendants. Results can be viewed as a compact gallery or
+with progressively more descriptive context.
 
 ## How the collection is stored
 
-Each position has its own folder. The main image, optional SGF, YAML annotations,
-and solution images stay together:
+Each position has its own folder containing its media and YAML record. Its SGF
+can supply the main board and any number of solution board views, with images
+stored alongside it when used:
 
 ```text
 positions/
   p000001/
     position.png
-    position.sgf                 # optional
+    position.sgf
     metadata.yaml
     solutions/
       solution-001.png
-      solution-002.png
 tags.yaml
 generated/
   tag_index.yaml
 ```
 
-A typical position record looks like this:
-
-```yaml
-description: White can take reverse sente before tenuki.
-score: B +3.5
-main_media_kind: board
-sgf_start_path: [0, 1]
-tags:
-  - 3-3-joseki
-  - reverse-sente
-metadata:
-  source: Cho Chikun encyclopedia
-  game: Kitani vs Seigen
-  move: 38
-solution_images:
-  - file: solutions/solution-001.png
-    kind: image
-    description: White resists immediately.
-    score: W +1.5
-    sgf_start_path: [0, 1, 2]
-  - file: ''
-    kind: board
-    description: Quiet continuation shown on the native board.
-    score: B +0.5
-    sgf_start_path: [0, 2]
-```
-
-An `sgf_start_path` identifies a node by listing the child index taken at each
-branch from the SGF root. An empty list means the root node. Paths remain
-unambiguous even when separate variations contain the same move number.
-`main_media_kind` and each solution's `kind` choose whether the app displays the
-SGF board or image when both are available.
-
-The app maintains its search index automatically. On startup it also checks the
-collection and normalizes unambiguous image and SGF filenames. The generated
+Only the files actually used by a position need to be present. The generated tag
 index can always be rebuilt from the position records and `tags.yaml`.
 
-Your database files are ignored by this repository's `.gitignore`, so cloning the
-application starts with an empty collection. If you want to version your own
-collection, place it in a separate folder, initialize a Git repository there,
-and launch with `python go_db.py --root <database-folder> gui`.
+The collection paths and canonical filenames can be changed in `config.yaml`:
 
-## Optional command-line interface
+```yaml
+positions_directory: positions
+tags_file: tags.yaml
+generated_index: generated/tag_index.yaml
 
-The CLI still works with the current data format. It is useful for scripting,
-bulk maintenance, validation, and machine-readable searches. The GUI remains the
-recommended way to work with scores and solution images: the CLI displays and
-preserves those fields but does not yet provide dedicated commands to edit them.
+files:
+  sgf: position.sgf
+  image: position.png
+  metadata: metadata.yaml
+```
 
-Global options, written before the command:
+The repository ignores its default collection files, so a fresh clone starts
+empty. To version a personal collection, the safest arrangement is a separate
+folder and Git repository launched with:
+
+```powershell
+python go_db.py --root <database-folder> gui
+```
+
+This keeps application updates and private collection history independent.
+
+## Command-line tools
+
+The desktop app is recommended for everyday use, while the CLI supports
+scripting, inspection, validation, and bulk maintenance. Global options appear
+before the command:
 
 ```text
 --root PATH       use a particular database folder
 --config PATH     use a particular config.yaml
 ```
 
-### Launch and initialize
+### Initialize and launch
 
 ```powershell
 python go_db.py --root . init
@@ -289,8 +208,9 @@ python go_db.py --root . init --force
 python go_db.py --root . gui
 ```
 
-`init --force` overwrites the starter configuration and tag files; it does not
-erase position folders.
+`init` creates the collection folders and starter configuration. `init --force`
+overwrites the starter configuration and tag files, but does not erase position
+folders.
 
 ### Search and inspect
 
@@ -299,14 +219,15 @@ python go_db.py --root . search "joseki AND NOT ko"
 python go_db.py --root . search "joseki" --verbose
 python go_db.py --root . search "joseki" --json
 python go_db.py --root . search "joseki" --limit 20
+
 python go_db.py --root . position show p000001
 python go_db.py --root . position show p000001 --json
 ```
 
-JSON search and `position show` include descriptions, scores, metadata, and
-solution-image records.
+Verbose and structured output include descriptions, scores, metadata, solution
+records, and media paths where applicable.
 
-### Validate and maintain files
+### Validate and maintain the collection
 
 ```powershell
 python go_db.py --root . check
@@ -316,21 +237,31 @@ python go_db.py --root . clean
 python go_db.py --root . clean p000001 p000002
 ```
 
-`check` reports missing images or metadata, ambiguous files, unknown or duplicate
-tags, invalid hierarchy links or cycles, and an inconsistent generated index.
-`clean` gives uniquely identifiable images and SGFs their canonical filenames.
+`check` reports inconsistent position records, media, tags, hierarchy links, or
+the generated index. `rebuild-index` regenerates the search index from the
+canonical records. `clean` normalizes uniquely identifiable image and SGF
+filenames; use `--dry-run` to preview the changes.
 
 ### Create and edit positions
 
 ```powershell
-python go_db.py --root . position create p000001 --image C:\path\board.png
-python go_db.py --root . position create p000002 --image C:\path\board.png --sgf C:\path\game.sgf --description "Corner variation" --tag joseki --meta "move=38"
+python go_db.py --root . position create p000001 --sgf C:\path\position.sgf
+python go_db.py --root . position create p000002 --image C:\path\board.png
+python go_db.py --root . position create p000003 --image C:\path\board.png --sgf C:\path\game.sgf --description "Corner variation" --tag joseki --meta "move=38"
 
 python go_db.py --root . position add-tag p000001 joseki reverse-sente
 python go_db.py --root . position remove-tag p000001 reverse-sente
 python go_db.py --root . position set-tags p000001 joseki tesuji
 python go_db.py --root . position set-description p000001 "Black should connect first."
+```
 
+Creation requires an image, an SGF, or both. `--tag` and `--meta KEY=VALUE` can
+be repeated. `position` can be shortened to `pos`.
+
+Metadata supports nested keys and values parsed as JSON when possible, so
+numbers, booleans, arrays, and objects retain their types:
+
+```powershell
 python go_db.py --root . position meta-set p000001 source "study notes"
 python go_db.py --root . position meta-set p000001 source.page 127
 python go_db.py --root . position meta-show p000001
@@ -338,11 +269,8 @@ python go_db.py --root . position meta-show p000001 source.page
 python go_db.py --root . position meta-delete p000001 source.page
 ```
 
-`position` can be shortened to `pos`. `--tag` and `--meta KEY=VALUE` are
-repeatable during creation. Metadata values are parsed as JSON when possible, so
-numbers, booleans, arrays, and objects retain their types. CLI creation requires
-at least an image or an SGF; the desktop workflow is designed around positions
-with a main image.
+The CLI reads and preserves scores and solution records, but those fields are
+currently edited through the desktop app.
 
 ### Manage tags
 
@@ -358,44 +286,24 @@ python go_db.py --root . tag remove unused-tag
 python go_db.py --root . tag remove unused-parent --force
 ```
 
-`tag` can be written as `tags`. Removing a tag is blocked while positions use it
-directly. `--force` permits removal from child parent-lists; it does not silently
-remove the tag from positions.
+`tag` can also be written as `tags`. Removing a tag is blocked while positions
+refer to it directly. `--force` permits removal from child parent-lists; it does
+not discard position references.
 
-## Configuration
+Run `python go_db.py --help`, or add `--help` after a command or subcommand, for
+the complete accepted syntax.
 
-`config.yaml` controls the collection paths and canonical filenames. Relative
-paths are interpreted from the selected database root:
+## Transparency
 
-```yaml
-positions_directory: positions
-tags_file: tags.yaml
-generated_index: generated/tag_index.yaml
+This project was heavily **vibe-coded with AI assistance**. Back up an important
+collection before large imports or bulk file operations.
 
-files:
-  sgf: position.sgf
-  image: position.png
-  metadata: metadata.yaml
-  sgf_extensions: [.sgf]
-  image_extensions: [.png, .jpg, .jpeg, .webp, .bmp, .gif]
-```
+## Future updates
 
-## Transparency and limitations
+Possible future directions include:
 
-This project was heavily **vibe-coded with AI assistance**. Back up an
-important collection before large imports or bulk file operations.
+- a preset vocabulary of common Go tags;
+- publishing, sharing, or merging collections; and
+- integration with KataGo analysis.
 
-The native SGF board can edit numbered labels, triangles, circles, squares, and
-crosses. Moves and the structure of the game tree are still read-only.
-
-## Future Updates
-
-Some things this project wants to add include
-
-- Preset list of common tags, might publish my own position collection
-- Possibility to publish, share, or merge positions with others
-- Customizable color scheme/layout. Greater compatibility with different screen sizes.
-- Expand the native SGF board with move and game-tree editing
-- Integrate the native board with KataGo analysis
-
-Any pull requests implementing these would be extremely welcome.
+Pull requests are welcome.

@@ -152,20 +152,23 @@ class GoPositionDatabase:
             d = position_dir(self.config, position_id)
             meta = d / self.config.metadata_filename
             errors.extend(entry_file_issues(self.config, position_id))
+            media_resolution_failed = False
             try:
                 image = position_image_path(self.config, position_id)
             except DatabaseError as e:
                 image = None
+                media_resolution_failed = True
                 if not any(str(e) in existing for existing in errors):
                     errors.append(f"{position_id}: {e}")
-            if image is None:
-                errors.append(f"{position_id}: missing image ({', '.join(self.config.image_extensions)})")
-            # SGF is optional. If present, resolution/ambiguity is still validated.
             try:
-                position_sgf_path(self.config, position_id)
+                sgf = position_sgf_path(self.config, position_id)
             except DatabaseError as e:
+                sgf = None
+                media_resolution_failed = True
                 if not any(str(e) in existing for existing in errors):
                     errors.append(f"{position_id}: {e}")
+            if not media_resolution_failed and image is None and sgf is None:
+                errors.append(f"{position_id}: missing main image or SGF")
             if not meta.exists():
                 errors.append(f"{position_id}: missing {self.config.metadata_filename}")
                 continue
