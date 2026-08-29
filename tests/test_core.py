@@ -92,6 +92,43 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(DatabaseError):
             g.add_parent("joseki", "3-3-joseki")
 
+    def test_index_rebuild_removes_tags_made_redundant_by_new_hierarchy_edges(self):
+        from go_position_db.storage import save_position
+
+        record = load_position(self.cfg, "p1")
+        record["tags"] = ["3-3-joseki", "reverse-sente"]
+        save_position(self.cfg, "p1", record)
+
+        graph = TagGraph(self.cfg)
+        graph.add_parent("reverse-sente", "3-3-joseki")
+        GoPositionDatabase(self.cfg).rebuild_index()
+
+        self.assertEqual(load_position(self.cfg, "p1")["tags"], ["reverse-sente"])
+        index = GoPositionDatabase(self.cfg).build_index_data()
+        self.assertEqual(index["explicit_tag_to_positions"]["3-3-joseki"], [])
+        self.assertIn("p1", index["tag_to_positions"]["3-3-joseki"])
+
+    def test_deleting_a_tag_also_removes_direct_position_references(self):
+        db = GoPositionDatabase(self.cfg)
+        affected = db.delete_tag("large-reverse-sente")
+
+        self.assertEqual(affected, ["p3"])
+        self.assertFalse(TagGraph(self.cfg).has("large-reverse-sente"))
+        self.assertEqual(load_position(self.cfg, "p3")["tags"], [])
+        rebuilt = db.build_index_data()
+        self.assertNotIn("large-reverse-sente", rebuilt["tag_to_positions"])
+
+    def test_index_cleanup_discards_unknown_position_tags(self):
+        from go_position_db.storage import save_position
+
+        record = load_position(self.cfg, "p2")
+        record["tags"] = ["joseki", "missing-tag"]
+        save_position(self.cfg, "p2", record)
+
+        GoPositionDatabase(self.cfg).rebuild_index()
+
+        self.assertEqual(load_position(self.cfg, "p2")["tags"], ["joseki"])
+
     def test_position_score_and_solution_images(self):
         record = load_position(self.cfg, "p1")
         record.update({

@@ -9,8 +9,21 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from PySide6.QtCore import QEvent, QRect, QRectF, Qt, QSize, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QClipboard, QDesktopServices, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, Qt, QSize, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QColor,
+    QClipboard,
+    QDesktopServices,
+    QImage,
+    QKeySequence,
+    QPalette,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShortcut,
+    QTextCharFormat,
+    QTextLayout,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -32,13 +45,13 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMenu,
-    QMessageBox,
     QPushButton,
     QPlainTextEdit,
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
     QStyle,
+    QStyleOptionFrame,
     QStyledItemDelegate,
     QSplitter,
     QTableWidget,
@@ -47,10 +60,12 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from .config import DEFAULT_ROOT, load_config
 from .database import GoPositionDatabase
+from .dialogs import SilentMessageBox as QMessageBox
 from .storage import (
     DatabaseError,
     atomic_dump_yaml,
@@ -69,6 +84,7 @@ from .tags import TagGraph, normalize_tag_name, validate_new_tag_name
 
 IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)"
 SGF_FILTER = "SGF Files (*.sgf);;All Files (*)"
+NEW_SGF_TEXT = "(;GM[1]FF[4]CA[UTF-8]AP[Go Position DB]SZ[19])"
 
 
 @dataclass
@@ -116,15 +132,7 @@ def suggest_next_position_id(config, prefix: str = "p", width: int = 6) -> str:
 
 def minimal_explicit_tags(graph: TagGraph, tags: list[str]) -> list[str]:
     """Canonicalize tags and remove any tag already implied by a descendant."""
-    canonical: list[str] = []
-    for tag in tags:
-        value = graph.canonical(tag)
-        if value not in canonical:
-            canonical.append(value)
-    return [
-        tag for tag in canonical
-        if not any(tag in graph.ancestors(other, include_self=False) for other in canonical if other != tag)
-    ]
+    return graph.minimal_explicit_tags(tags)
 
 
 def score_chip_stylesheet(value: str, editable: bool = False) -> str:
@@ -264,29 +272,73 @@ class TagQueryLineEdit(QLineEdit):
         return contains[0] if contains else None
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
-        # Let QLineEdit paint its own text, selection, and cursor.  Drawing only a
-        # colored copy of recognized tag glyphs preserves exact editing geometry.
         super().paintEvent(event)
+        if not self._boolean_query_mode:
+            return
         text = self.text()
         if not text:
             return
+
+        # QLineEdit cannot apply formats to substrings. Clear only its text area
+        # after the native frame is painted, then draw the full query exactly once
+        # with QTextLayout so tag coloring shares the same glyph geometry.
+        option = QStyleOptionFrame()
+        self.initStyleOption(option)
+        text_rect = self.style().subElementRect(
+            QStyle.SE_LineEditContents, option, self
+        )
+        margins = self.textMargins()
+        text_rect.adjust(
+            margins.left(), margins.top(), -margins.right(), -margins.bottom()
+        )
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setClipRect(self.contentsRect())
+        painter.setClipRect(text_rect)
+        painter.fillRect(text_rect, self.palette().brush(QPalette.Base))
+
         metrics = self.fontMetrics()
         cursor = self.cursorPosition()
         text_offset = self.cursorRect().x() - metrics.horizontalAdvance(text[:cursor])
+        if metrics.horizontalAdvance(text) <= text_rect.width():
+            text_offset = text_rect.left()
         selection_start = self.selectionStart()
         selection_end = selection_start + len(self.selectedText()) if selection_start >= 0 else -1
         baseline = (self.height() - metrics.height()) // 2 + metrics.ascent()
-        painter.setPen(QColor("#a34f70"))
+
+        layout = QTextLayout(text, self.font())
+        formats: list[QTextLayout.FormatRange] = []
         for match in self._tag_matches(text):
             start, end = match.span()
-            if selection_start >= 0 and start < selection_end and end > selection_start:
-                continue
-            token = match.group(0)
-            x = text_offset + metrics.horizontalAdvance(text[:start])
-            painter.drawText(x, baseline, token)
+            tag_format = QTextCharFormat()
+            tag_format.setForeground(QColor("#a34f70"))
+            tag_range = QTextLayout.FormatRange()
+            tag_range.start = start
+            tag_range.length = end - start
+            tag_range.format = tag_format
+            formats.append(tag_range)
+        if selection_start >= 0:
+            selection_format = QTextCharFormat()
+            selection_format.setBackground(self.palette().brush(QPalette.Highlight))
+            selection_format.setForeground(self.palette().brush(QPalette.HighlightedText))
+            selection_range = QTextLayout.FormatRange()
+            selection_range.start = selection_start
+            selection_range.length = selection_end - selection_start
+            selection_range.format = selection_format
+            formats.append(selection_range)
+        layout.setFormats(formats)
+        layout.beginLayout()
+        line = layout.createLine()
+        line.setLineWidth(max(text_rect.width(), metrics.horizontalAdvance(text) + 8))
+        layout.endLayout()
+        layout.draw(painter, QPointF(text_offset, baseline - line.ascent()))
+
+        if self.hasFocus() and selection_start < 0 and not self.isReadOnly():
+            cursor_x = text_offset + metrics.horizontalAdvance(text[:cursor])
+            painter.setPen(self.palette().color(QPalette.Text))
+            painter.drawLine(
+                QPointF(cursor_x, baseline - metrics.ascent()),
+                QPointF(cursor_x, baseline + metrics.descent()),
+            )
 
 
 TAG_LIST_STYLESHEET = """
@@ -549,11 +601,15 @@ class TagSetEditor(QWidget):
         try:
             graph = TagGraph(self.config)
             if not graph.has(text):
-                QMessageBox.information(
+                if QMessageBox.question(
                     self,
-                    "Creating Tag",
-                    f"'{text}' is a new tag. It will be created and added to this position.",
-                )
+                    "Create New Tag?",
+                    f"'{text}' is not an existing tag. Create it and add it to this position?",
+                    QMessageBox.Yes | QMessageBox.Cancel,
+                    QMessageBox.Cancel,
+                ) != QMessageBox.Yes:
+                    self.add_edit.setFocus()
+                    return
                 graph.add(text)
                 GoPositionDatabase(self.config).rebuild_index()
                 self.set_available_tags(graph.names())
@@ -923,8 +979,6 @@ class PositionImageSurface(QWidget):
 
 
 class PositionImageGallery(QWidget):
-    image_selected = Signal(int)
-
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         layout = QGridLayout(self)
@@ -938,35 +992,12 @@ class PositionImageGallery(QWidget):
         self.media_stack.addWidget(self.sgf_board)
         layout.addWidget(self.media_stack, 0, 0)
 
-        self.previous_button = QToolButton()
-        self.previous_button.setText("‹")
-        self.next_button = QToolButton()
-        self.next_button.setText("›")
-        for button in (self.previous_button, self.next_button):
-            button.setFixedSize(30, 46)
-            button.setAutoRaise(True)
-            button.setStyleSheet(
-                "QToolButton { border: 1px solid #cfc5c8; color: #55464c; "
-                "background: rgba(255,253,253,235); border-radius: 10px; "
-                "font-size: 22px; font-weight: 700; padding: 0; }"
-                "QToolButton:hover { background: #f8e8ee; border-color: #d49aad; color: #673548; }"
-                "QToolButton:disabled { color: #c9bfc2; background: rgba(255,253,253,140); }"
-            )
-        layout.addWidget(self.previous_button, 0, 0, Qt.AlignLeft | Qt.AlignVCenter)
-        layout.addWidget(self.next_button, 0, 0, Qt.AlignRight | Qt.AlignVCenter)
-        self.previous_button.raise_()
-        self.next_button.raise_()
-        self.position_label = QLabel("", self)
-        self.position_label.hide()
-
         self.images: list[tuple[str, QPixmap]] = []
         self.has_sgf = False
         self.sgf_path: Path | None = None
         self.sgf_text: str | None = None
         self.board_start_paths: dict[int, list[int]] = {}
         self.selected_index = 0
-        self.previous_button.clicked.connect(lambda: self.select_image(self.selected_index - 1))
-        self.next_button.clicked.connect(lambda: self.select_image(self.selected_index + 1))
         self.sgf_board.sgf_edited.connect(self._remember_sgf_text)
 
     def _remember_sgf_text(self, text: str) -> None:
@@ -989,13 +1020,13 @@ class PositionImageGallery(QWidget):
             self.board_start_paths.setdefault(0, list(sgf_start_path))
         else:
             self.sgf_board.clear()
-        self.select_image(min(self.selected_index, max(0, len(images) - 1)), emit=False)
+        self.select_image(min(self.selected_index, max(0, len(images) - 1)))
 
-    def select_image(self, index: int, emit: bool = True) -> None:
+    def select_image(self, index: int) -> None:
         if not 0 <= index < len(self.images):
             return
         self.selected_index = index
-        title, pixmap = self.images[index]
+        _title, pixmap = self.images[index]
         self.image_label.set_source_pixmap(pixmap, "No image")
         show_board = self.has_sgf and index in self.board_start_paths
         if show_board:
@@ -1007,17 +1038,6 @@ class PositionImageGallery(QWidget):
             self.media_stack.setCurrentWidget(self.sgf_board)
         else:
             self.media_stack.setCurrentWidget(self.image_surface)
-        has_multiple = len(self.images) > 1
-        self.previous_button.setVisible(has_multiple)
-        self.next_button.setVisible(has_multiple)
-        self.position_label.hide()
-        self.previous_button.setEnabled(index > 0)
-        self.next_button.setEnabled(index < len(self.images) - 1)
-        self.position_label.setText(f"{title}  {index + 1}/{len(self.images)}")
-        self.previous_button.setToolTip("Previous image")
-        self.next_button.setToolTip("Next image")
-        if emit:
-            self.image_selected.emit(index)
 
 
 class PositionEditor(QWidget):
@@ -1099,6 +1119,20 @@ class PositionEditor(QWidget):
         solution_controls_layout.setContentsMargins(0, 3, 0, 3)
         solution_controls_layout.setSpacing(0)
         solution_controls_layout.setAlignment(Qt.AlignVCenter)
+        self.baseline_menu_button = QToolButton(self.solution_controls)
+        self.baseline_menu_button.setText("Set baseline")
+        self.baseline_menu_button.setPopupMode(QToolButton.InstantPopup)
+        self.baseline_menu_button.setStyleSheet(
+            "QToolButton { min-height: 38px; max-height: 38px; "
+            "border: 1px solid #a9c8dc; border-radius: 8px; "
+            "background: #edf5fa; color: #356f9f; padding: 0 10px; "
+            "font-weight: 650; }"
+            "QToolButton:hover { background: #dcecf5; border-color: #79a9c7; }"
+        )
+        self.baseline_menu_button.setFixedHeight(40)
+        solution_controls_layout.addWidget(self.baseline_menu_button)
+        solution_controls_layout.addSpacing(10)
+
         self.solution_strip = QFrame(self.solution_controls)
         self.solution_strip.setObjectName("solutionStrip")
         self.solution_strip.setFixedHeight(40)
@@ -1120,31 +1154,14 @@ class PositionEditor(QWidget):
         solution_strip_slot_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         solution_strip_slot_layout.addWidget(self.solution_strip)
         solution_controls_layout.addWidget(self.solution_strip_slot)
-        solution_controls_layout.addSpacing(24)
-
-        self.baseline_menu_button = QToolButton(self.solution_controls)
-        self.baseline_menu_button.setText("Set baseline")
-        self.baseline_menu_button.setPopupMode(QToolButton.InstantPopup)
-        self.baseline_menu_button.setStyleSheet(
-            "QToolButton { min-height: 38px; max-height: 38px; "
-            "border: 1px solid #a9c8dc; border-radius: 8px; "
-            "background: #edf5fa; color: #356f9f; padding: 0 10px; "
-            "font-weight: 650; }"
-            "QToolButton:hover { background: #dcecf5; border-color: #79a9c7; }"
+        board_header_layout.addWidget(
+            self.solution_controls, 0, Qt.AlignRight | Qt.AlignVCenter
         )
-        self.baseline_menu_button.setFixedHeight(40)
-        solution_controls_layout.addWidget(self.baseline_menu_button)
-        solution_controls_layout.addSpacing(10)
-        self.solution_delete_button = QToolButton(self.solution_controls)
-        self.solution_delete_button.setText("Del")
-        self.solution_delete_button.setToolTip("Delete the selected solution")
-        self.solution_delete_button.setFixedSize(48, 40)
-        self.solution_delete_button.clicked.connect(self.remove_selected_solution)
-        solution_controls_layout.addWidget(self.solution_delete_button)
 
-        self.sgf_menu_btn = QPushButton("Replace SGF")
-        self.sgf_menu_btn.setToolTip("Attach or replace the position SGF")
-        self.sgf_menu_btn.clicked.connect(self.choose_sgf)
+        self.sgf_menu_btn = QToolButton()
+        self.sgf_menu_btn.setText("SGF")
+        self.sgf_menu_btn.setPopupMode(QToolButton.InstantPopup)
+        self.sgf_menu_btn.setToolTip("Choose, create, or remove the position SGF")
 
         self.open_folder_btn = QToolButton()
         self.open_folder_btn.setText("Folder")
@@ -1166,10 +1183,10 @@ class PositionEditor(QWidget):
             button.setFixedSize(108, 40)
         self.delete_btn.setStyleSheet(
             "QToolButton { min-height: 38px; max-height: 38px; padding: 0 10px; "
-            "border: 1px solid #d5a1aa; border-radius: 8px; "
-            "background: #fff1f3; color: #8b3446; font-weight: 700; }"
-            "QToolButton:hover { background: #f6d8de; border-color: #c87687; "
-            "color: #77283a; }"
+            "border: 1px solid #bd5c70; border-radius: 8px; "
+            "background: #f6c7cf; color: #702438; font-weight: 750; }"
+            "QToolButton:hover { background: #ecaeb9; border-color: #a94359; "
+            "color: #5f172a; }"
         )
         self.delete_btn.setFixedSize(108, 40)
         action_header = QWidget()
@@ -1183,8 +1200,8 @@ class PositionEditor(QWidget):
         action_header_layout.addWidget(self.sgf_menu_btn)
         action_header_layout.addWidget(self.open_folder_btn)
         action_header_layout.addWidget(self.delete_btn)
-        header.addWidget(board_header, 5)
-        header.addWidget(action_header, 4)
+        header.addWidget(board_header, 4)
+        header.addWidget(action_header, 3)
         self.save_status_label = QLabel("")
         self.save_status_label.setStyleSheet("color: #5f6368;")
         layout.addLayout(header)
@@ -1196,13 +1213,14 @@ class PositionEditor(QWidget):
         image_panel_layout.setContentsMargins(0, 0, 0, 0)
         image_panel_layout.setSpacing(4)
         self.image_gallery = PositionImageGallery()
-        self.image_gallery.setMinimumWidth(585)
+        self.image_gallery.setMinimumWidth(620)
         image_panel_layout.addWidget(self.image_gallery, 1)
+        self.image_panel = image_panel
         self.editor_splitter.addWidget(image_panel)
 
         details = QWidget()
-        details.setMinimumWidth(430)
-        details.setMaximumWidth(880)
+        details.setMinimumWidth(390)
+        details.setMaximumWidth(700)
         details_layout = QVBoxLayout(details)
         details_layout.setContentsMargins(0, 0, 0, 0)
         details_layout.setSpacing(8)
@@ -1226,10 +1244,11 @@ class PositionEditor(QWidget):
         metadata_layout.addWidget(self.metadata_editor)
         details_layout.addWidget(metadata_box, 2)
 
+        self.details_panel = details
         self.editor_splitter.addWidget(details)
-        self.editor_splitter.setStretchFactor(0, 5)
-        self.editor_splitter.setStretchFactor(1, 4)
-        self.editor_splitter.setSizes([820, 700])
+        self.editor_splitter.setStretchFactor(0, 4)
+        self.editor_splitter.setStretchFactor(1, 3)
+        self.editor_splitter.setSizes([850, 630])
         layout.addWidget(self.editor_splitter, 1)
 
         self.back_btn.clicked.connect(self.back_requested.emit)
@@ -1243,15 +1262,29 @@ class PositionEditor(QWidget):
         self.tags_editor.changed.connect(self.schedule_autosave)
         self.tags_editor.tag_created.connect(lambda _name: self.database_changed.emit())
         self.metadata_editor.changed.connect(self.schedule_autosave)
-        self.image_gallery.image_selected.connect(self.select_image)
         self.image_gallery.sgf_board.start_requested.connect(self.set_selected_sgf_start_path)
         self.image_gallery.sgf_board.sgf_edited.connect(self.set_pending_sgf_text)
 
-        self.setEnabled(False)
+        self.previous_solution_shortcut = QShortcut(
+            QKeySequence("Ctrl+Left"), self,
+        )
+        self.previous_solution_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.previous_solution_shortcut.activated.connect(
+            lambda: self.navigate_solution(-1)
+        )
+        self.next_solution_shortcut = QShortcut(
+            QKeySequence("Ctrl+Right"), self,
+        )
+        self.next_solution_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.next_solution_shortcut.activated.connect(
+            lambda: self.navigate_solution(1)
+        )
+        app = QApplication.instance()
+        if app is not None:
+            app.focusChanged.connect(self._update_solution_shortcuts)
+        self._update_solution_shortcuts(None, QApplication.focusWidget())
 
-    def resizeEvent(self, event) -> None:  # type: ignore[override]
-        super().resizeEvent(event)
-        self._position_solution_strip()
+        self.setEnabled(False)
 
     def _clear_solution_tabs(self) -> None:
         while self.solution_tabs_layout.count():
@@ -1289,11 +1322,16 @@ class PositionEditor(QWidget):
         menu = QMenu(self.baseline_menu_button)
         menu.addAction("Image from file…", self.choose_selected_image)
         menu.addAction("Image from clipboard", self.paste_selected_image)
-        current_node_action = menu.addAction(
-            "Current SGF node", self.set_current_node_as_selected_start
-        )
-        has_sgf_node = self.image_gallery.sgf_board.current_frame is not None
-        current_node_action.setEnabled(has_sgf_node)
+        has_sgf = self._has_sgf()
+        if has_sgf:
+            current_node_action = menu.addAction(
+                "Current SGF node", self.set_current_node_as_selected_start
+            )
+            current_node_action.setEnabled(
+                self.image_gallery.sgf_board.current_frame is not None
+            )
+        else:
+            menu.addAction("Create new SGF", lambda: self.create_new_sgf())
         menu.addSeparator()
         show_board = menu.addAction(
             "Display SGF board",
@@ -1311,44 +1349,47 @@ class PositionEditor(QWidget):
         show_image.setCheckable(True)
         show_image.setChecked(self._selected_media_kind() == "image")
         show_image.setEnabled(self._selected_has_image())
+        menu.addSeparator()
+        delete_solution = QWidgetAction(menu)
+        delete_solution.setText("Del — remove selected solution…")
+        delete_solution.setToolTip(
+            "Remove the selected solution after confirmation; the main position is not deleted."
+        )
+        delete_solution_button = QPushButton("Del — Remove selected solution…")
+        delete_solution_button.setToolTip(delete_solution.toolTip())
+        delete_solution_button.setStyleSheet(
+            "QPushButton { min-height: 32px; margin: 2px 5px; padding: 0 10px; "
+            "text-align: left; border: 1px solid #bd5c70; border-radius: 5px; "
+            "background: #f6c7cf; color: #702438; font-weight: 750; }"
+            "QPushButton:hover { background: #ecaeb9; border-color: #a94359; }"
+            "QPushButton:disabled { background: #f3e8ea; border-color: #d9c9cd; "
+            "color: #aa969c; }"
+        )
+        is_solution = self.selected_image_index > 0
+        delete_solution.setEnabled(is_solution)
+        delete_solution_button.setEnabled(is_solution)
+        delete_solution_button.clicked.connect(menu.close)
+        delete_solution_button.clicked.connect(self.remove_selected_solution)
+        delete_solution.setDefaultWidget(delete_solution_button)
+        menu.addAction(delete_solution)
+        menu.addSeparator()
         self.baseline_menu_button.setMenu(menu)
         self.baseline_menu_button.setToolTip(
             f"Selected baseline: {self._selected_media_kind()}"
         )
-        # Keep this slot in the layout even on Main so selecting a solution
-        # never makes the centered header controls jump sideways.
-        is_solution = self.selected_image_index > 0
-        self.solution_delete_button.setText("Del" if is_solution else "")
-        self.solution_delete_button.setEnabled(is_solution)
-        self.solution_delete_button.setToolTip(
-            "Delete the selected solution" if is_solution else ""
-        )
-        if is_solution:
-            self.solution_delete_button.setStyleSheet(
-                "QToolButton { min-height: 38px; max-height: 38px; padding: 0 8px; "
-                "border: 1px solid #dec8ce; border-radius: 8px; "
-                "background: #fffafa; color: #704450; font-weight: 700; }"
-                "QToolButton:hover { background: #f5cfd8; border-color: #d7a4b1; }"
-            )
-        else:
-            self.solution_delete_button.setStyleSheet(
-                "QToolButton { min-height: 38px; max-height: 38px; padding: 0; "
-                "border: 1px solid transparent; background: transparent; }"
-            )
-        self.solution_delete_button.setFixedSize(48, 40)
+        self._rebuild_sgf_menu()
 
-    def _position_solution_strip(self) -> None:
-        # Anchor the selector just after the position identity. Its reserved
-        # lane lets it grow only to the right without moving the baseline tools.
-        self.solution_controls.adjustSize()
-        hint = self.solution_controls.sizeHint()
-        self.solution_controls.resize(hint)
-        preferred_left = self.header_identity.geometry().right() + 28
-        self.solution_controls.move(
-            max(0, min(preferred_left, self.board_header.width() - hint.width())),
-            max(0, round((self.board_header.height() - hint.height()) / 2)),
-        )
-        self.solution_controls.raise_()
+    def _has_sgf(self) -> bool:
+        return self.pending_sgf_text is not None or self._current_sgf_path() is not None
+
+    def _rebuild_sgf_menu(self) -> None:
+        menu = QMenu(self.sgf_menu_btn)
+        menu.addAction("Choose SGF from file…", self.choose_sgf)
+        menu.addAction("Create new SGF", lambda: self.create_new_sgf())
+        if self._has_sgf():
+            menu.addSeparator()
+            menu.addAction("Remove SGF…", self.mark_clear_sgf)
+        self.sgf_menu_btn.setMenu(menu)
 
     def _rebuild_solution_tabs(self) -> None:
         self._clear_solution_tabs()
@@ -1441,7 +1482,7 @@ class PositionEditor(QWidget):
         add_button.clicked.connect(self.add_solution_board)
         self.solution_tabs_layout.addWidget(add_button)
         self._rebuild_baseline_menu()
-        QTimer.singleShot(0, self._position_solution_strip)
+        self.solution_controls.updateGeometry()
 
     def set_available_tags(self, tags: list[str]) -> None:
         self.tags_editor.set_available_tags(tags)
@@ -1542,6 +1583,27 @@ class PositionEditor(QWidget):
         self._loading = False
         self._rebuild_solution_tabs()
 
+    def navigate_solution(self, delta: int) -> None:
+        item_count = len(self.solution_images) + 1
+        if item_count <= 1:
+            return
+        self.refresh_gallery((self.selected_image_index + delta) % item_count)
+
+    @staticmethod
+    def _has_text_input_focus(widget: QWidget | None) -> bool:
+        while widget is not None:
+            if isinstance(widget, (QLineEdit, QTextEdit, QPlainTextEdit)):
+                return True
+            widget = widget.parentWidget()
+        return False
+
+    def _update_solution_shortcuts(
+        self, _old: QWidget | None, current: QWidget | None
+    ) -> None:
+        enabled = not self._has_text_input_focus(current)
+        self.previous_solution_shortcut.setEnabled(enabled)
+        self.next_solution_shortcut.setEnabled(enabled)
+
     def _on_description_changed(self) -> None:
         if self._loading:
             return
@@ -1619,7 +1681,6 @@ class PositionEditor(QWidget):
         self.selected_image_index = 0
         self.transient_new_position = False
         self.position_id_label.clear()
-        self._position_solution_strip()
         self.score_edit.clear()
         self.description_edit.clear()
         self.tags_editor.set_tags([])
@@ -1640,7 +1701,6 @@ class PositionEditor(QWidget):
         self._loading = True
         self.current_position_id = position_id
         self.position_id_label.setText(position_id)
-        self._position_solution_strip()
         self.transient_new_position = False
         self.pending_image_path = None
         self.pending_image = None
@@ -1727,8 +1787,32 @@ class PositionEditor(QWidget):
             self.pending_sgf_text = None
             self.clear_sgf_on_save = False
             self.main_media_kind = "board"
+            self.main_sgf_start_path = []
+            for solution in self.solution_images:
+                solution["sgf_start_path"] = []
             self.refresh_gallery(0)
             self.schedule_autosave()
+
+    def create_new_sgf(self, *, confirm: bool = True) -> None:
+        if not self.current_position_id:
+            return
+        if self._has_sgf() and confirm and QMessageBox.question(
+            self,
+            "Create New SGF",
+            "Replace the current SGF with a new blank 19×19 SGF?",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        self.pending_sgf_path = None
+        self.pending_sgf_text = NEW_SGF_TEXT
+        self.clear_sgf_on_save = False
+        self.main_media_kind = "board"
+        self.main_sgf_start_path = []
+        for solution in self.solution_images:
+            solution["sgf_start_path"] = []
+        self.refresh_gallery(0)
+        self.schedule_autosave()
 
     def mark_clear_sgf(self) -> None:
         if not self.current_position_id:
@@ -2407,16 +2491,34 @@ class TagManagerPage(QWidget):
         if not name:
             return
         self.flush_description_save()
-        if QMessageBox.question(self, "Delete Tag", f"Delete tag '{name}'?") != QMessageBox.Yes:
-            return
+        db = GoPositionDatabase(self.config)
+        positions = db.all_positions()
+        affected = [
+            position_id for position_id, record in positions.items()
+            if any(
+                self.graph.has(tag) and self.graph.canonical(tag) == name
+                for tag in record.get("tags", [])
+            )
+        ]
+        if affected:
+            reference_note = (
+                f"It will also be removed from {len(affected)} directly tagged "
+                f"position{'s' if len(affected) != 1 else ''}."
+            )
+            if QMessageBox.question(
+                self, "Delete Tag", f"Delete tag '{name}'?\n\n{reference_note}"
+            ) != QMessageBox.Yes:
+                return
         try:
-            self.graph.remove(name)
-            GoPositionDatabase(self.config).rebuild_index()
+            db.delete_tag(name)
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             return
+        self.loaded_tag_name = None
+        self.filter_edit.clear()
         self.changed.emit()
         self.refresh()
+        self.load_selected_tag("")
 
     def add_parent(self) -> None:
         name = self._current_tag()

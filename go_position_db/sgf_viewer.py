@@ -7,7 +7,9 @@ from typing import Any
 from pysgf import GoGame, Move, ParseError
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
-from PySide6.QtWidgets import QHBoxLayout, QMessageBox, QSizePolicy, QToolButton, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QToolButton, QWidget
+
+from .dialogs import SilentMessageBox as QMessageBox
 
 # Board layout, expressed as multiples of one grid step. The coordinate labels sit
 # in COORD_ROOM on the top and left; a stone's outer half sits in STONE_ROOM on the
@@ -26,6 +28,7 @@ class SgfFrame:
     last_player: str | None
     comment: str
     node_path: tuple[int, ...]
+    has_setup_stones: bool = False
     labels: tuple[tuple[int, int, str], ...] = ()
     triangles: tuple[tuple[int, int], ...] = ()
     circles: tuple[tuple[int, int], ...] = ()
@@ -145,7 +148,11 @@ def _playback_from_root(root, start_path: list[int] | tuple[int, ...] = ()) -> S
     def visit(node, node_path: tuple[int, ...], incoming_board, move_number: int,
               last_move: tuple[int, int] | None, last_player: str | None) -> None:
         current_board = dict(incoming_board)
-        for point in _expanded_points(node.get_list_property("AE", []), board_size):
+        erased_points = _expanded_points(node.get_list_property("AE", []), board_size)
+        if last_move in erased_points:
+            last_move = None
+            last_player = None
+        for point in erased_points:
             current_board.pop(point, None)
         for player in ("B", "W"):
             for point in _expanded_points(node.get_list_property("A" + player, []), board_size):
@@ -180,6 +187,9 @@ def _playback_from_root(root, start_path: list[int] | tuple[int, ...] = ()) -> S
             last_player=last_player,
             comment=str(node.get_property("C", "") or ""),
             node_path=node_path,
+            has_setup_stones=any(
+                node.get_list_property(prop, []) for prop in ("AB", "AW")
+            ),
             labels=tuple(labels),
             triangles=tuple(sorted(_expanded_points(node.get_list_property("TR", []), board_size))),
             circles=tuple(sorted(_expanded_points(node.get_list_property("CR", []), board_size))),
@@ -323,15 +333,101 @@ def _draw_coordinates(
         )
 
 
+def _effective_markup(
+    frame: SgfFrame,
+    preview_point: tuple[int, int] | None = None,
+    preview_tool: str | None = None,
+) -> tuple[dict[str, set[tuple[int, int]]], list[tuple[int, int, str]]]:
+    triangles = set(frame.triangles)
+    circles = set(frame.circles)
+    squares = set(frame.squares)
+    crosses = set(frame.crosses)
+    labels = list(frame.labels)
+    shapes = {
+        "triangles": triangles,
+        "circles": circles,
+        "squares": squares,
+        "crosses": crosses,
+    }
+
+    if preview_point is not None and preview_tool is not None:
+        x, y = preview_point
+        matching_labels = [item for item in labels if item[:2] == preview_point]
+        if preview_tool in {"numbers", "letters"}:
+            already_has_annotation = any(
+                (preview_tool == "numbers" and label.isdigit())
+                or (preview_tool == "letters" and label.isalpha())
+                for _x, _y, label in matching_labels
+            )
+            if not already_has_annotation:
+                labels = [item for item in labels if item[:2] != preview_point]
+                for points in shapes.values():
+                    points.discard(preview_point)
+                if preview_tool == "numbers":
+                    used = {
+                        int(label) for _x, _y, label in labels if label.isdigit()
+                    }
+                    value = 1
+                    while value in used:
+                        value += 1
+                    label = str(value)
+                else:
+                    used = {
+                        label.upper() for _x, _y, label in labels if label.isalpha()
+                    }
+                    value = 0
+                    label = ReadOnlySgfBoard._alphabetic_label(value)
+                    while label in used:
+                        value += 1
+                        label = ReadOnlySgfBoard._alphabetic_label(value)
+                labels.append((x, y, label))
+        elif preview_tool in shapes:
+            already_has_annotation = preview_point in shapes[preview_tool]
+            if not already_has_annotation:
+                for points in shapes.values():
+                    points.discard(preview_point)
+                labels = [item for item in labels if item[:2] != preview_point]
+                shapes[preview_tool].add(preview_point)
+
+    return shapes, labels
+
+
+def _has_annotation_for_tool(
+    frame: SgfFrame, point: tuple[int, int], tool: str
+) -> bool:
+    shape_points = {
+        "triangles": frame.triangles,
+        "circles": frame.circles,
+        "squares": frame.squares,
+        "crosses": frame.crosses,
+    }
+    if tool in shape_points:
+        return point in shape_points[tool]
+    labels = [label for x, y, label in frame.labels if (x, y) == point]
+    if tool == "numbers":
+        return any(label.isdigit() for label in labels)
+    if tool == "letters":
+        return any(label.isalpha() for label in labels)
+    return False
+
+
 def _draw_markup(
     painter: QPainter,
-    frame: SgfFrame,
     left: float,
     bottom: float,
     step: float,
     radius: float,
     stone_players: dict[tuple[int, int], str],
+    shapes: dict[str, set[tuple[int, int]]],
+    labels: list[tuple[int, int, str]],
+    preview_point: tuple[int, int] | None = None,
+    preview_tool: str | None = None,
 ) -> None:
+    triangles = shapes["triangles"]
+    circles = shapes["circles"]
+    squares = shapes["squares"]
+    crosses = shapes["crosses"]
+
     def marker_pen(point: tuple[int, int]) -> QPen:
         return QPen(
             _annotation_color(point, stone_players),
@@ -341,8 +437,18 @@ def _draw_markup(
             Qt.RoundJoin,
         )
 
+    original_opacity = painter.opacity()
+
+    def set_preview_opacity(point: tuple[int, int], tool: str) -> None:
+        painter.setOpacity(
+            original_opacity * 0.58
+            if point == preview_point and tool == preview_tool
+            else original_opacity
+        )
+
     marker_radius = radius * 0.54
-    for point in frame.triangles:
+    for point in triangles:
+        set_preview_opacity(point, "triangles")
         center = _point(left, bottom, step, *point)
         painter.setPen(marker_pen(point))
         painter.setBrush(Qt.NoBrush)
@@ -351,12 +457,14 @@ def _draw_markup(
             QPointF(center.x() - marker_radius * 0.88, center.y() + marker_radius * 0.52),
             QPointF(center.x() + marker_radius * 0.88, center.y() + marker_radius * 0.52),
         ]))
-    for point in frame.circles:
+    for point in circles:
+        set_preview_opacity(point, "circles")
         center = _point(left, bottom, step, *point)
         painter.setPen(marker_pen(point))
         painter.setBrush(Qt.NoBrush)
         painter.drawEllipse(center, marker_radius, marker_radius)
-    for point in frame.squares:
+    for point in squares:
+        set_preview_opacity(point, "squares")
         center = _point(left, bottom, step, *point)
         painter.setPen(marker_pen(point))
         painter.setBrush(Qt.NoBrush)
@@ -364,25 +472,29 @@ def _draw_markup(
             center.x() - marker_radius, center.y() - marker_radius,
             marker_radius * 2, marker_radius * 2,
         ))
-    for point in frame.crosses:
+    for point in crosses:
+        set_preview_opacity(point, "crosses")
         center = _point(left, bottom, step, *point)
         painter.setPen(marker_pen(point))
         offset = marker_radius * 0.78
         painter.drawLine(center + QPointF(-offset, -offset), center + QPointF(offset, offset))
         painter.drawLine(center + QPointF(-offset, offset), center + QPointF(offset, -offset))
-    for x, y, label in frame.labels:
+    for x, y, label in labels:
         point = (x, y)
+        label_tool = "numbers" if label.isdigit() else "letters"
+        set_preview_opacity(point, label_tool)
         center = _point(left, bottom, step, x, y)
         painter.setPen(_annotation_color(point, stone_players))
         label_font = painter.font()
         label_font.setBold(True)
-        label_font.setPixelSize(max(9, int(radius * 0.86)))
+        label_font.setPixelSize(max(10, int(radius * 1.04)))
         painter.setFont(label_font)
         painter.drawText(
             QRectF(center.x() - radius, center.y() - radius, radius * 2, radius * 2),
             Qt.AlignCenter,
             label,
         )
+    painter.setOpacity(original_opacity)
 
 
 def _annotation_color(
@@ -398,11 +510,27 @@ def _annotation_color(
     return QColor("#318fc8")
 
 
+def _last_move_marker_visible(
+    frame: SgfFrame,
+    stone_points: set[tuple[int, int]],
+    annotated_points: set[tuple[int, int]],
+) -> bool:
+    return bool(
+        frame.last_move is not None
+        and frame.last_move in stone_points
+        and frame.last_move not in annotated_points
+        and not frame.has_setup_stones
+    )
+
+
 def paint_sgf_board(
     painter: QPainter,
     board_rect: QRectF,
     playback: SgfPlayback,
     frame: SgfFrame,
+    preview_point: tuple[int, int] | None = None,
+    preview_tool: str | None = None,
+    preview_player: str | None = None,
 ) -> None:
     """Paint the wood, grid, coordinates, stones, and markup for ``frame``.
 
@@ -429,25 +557,102 @@ def paint_sgf_board(
             QPointF(grain_x, board_rect.bottom() - 1),
         )
 
-    painter.setPen(QPen(QColor("#46351f"), max(1.0, side / 800)))
+    radius = step * 0.46
+    stones = {
+        (x, y): (player, placed_move_number)
+        for x, y, player, placed_move_number in frame.stones
+    }
+    translucent_point: tuple[int, int] | None = None
+    if preview_point is not None and preview_player in {"B", "W"}:
+        if preview_tool == "play" and preview_point not in stones:
+            # Hover is only a visual placement preview. It deliberately does not
+            # predict captures or reject suicide or ko. Occupied intersections
+            # simply have no preview; all rules remain enforced on click.
+            stones[preview_point] = (preview_player, frame.move_number + 1)
+            translucent_point = preview_point
+        elif preview_tool in {"black_setup", "white_setup"}:
+            stones[preview_point] = (preview_player, None)
+            translucent_point = preview_point
+    stone_players = {point: stone[0] for point, stone in stones.items()}
+
+    annotation_preview = preview_tool if preview_tool in {
+        "numbers", "letters", "triangles", "circles", "squares", "crosses"
+    } else None
+    applied_preview_point = (
+        preview_point
+        if preview_point is not None
+        and annotation_preview is not None
+        and not _has_annotation_for_tool(frame, preview_point, annotation_preview)
+        else None
+    )
+    shapes, labels = _effective_markup(frame, preview_point, annotation_preview)
+    annotated_points = set().union(*shapes.values())
+    annotated_points.update((x, y) for x, y, _label in labels)
+    faded_points = annotated_points.difference(stone_players)
+
+    line_width = max(1.0, side / 800)
+    normal_pen = QPen(QColor("#46351f"), line_width)
+    faded_pen = QPen(QColor(70, 53, 31, 70), line_width)
+    fade_radius = step * 0.27
+
+    def draw_line_with_fades(
+        fixed: float,
+        low: float,
+        high: float,
+        centers: list[float],
+        *,
+        vertical: bool,
+    ) -> None:
+        cursor = low
+        for center in sorted(centers):
+            faded_low = max(low, center - fade_radius)
+            faded_high = min(high, center + fade_radius)
+            if faded_high <= cursor:
+                continue
+            if faded_low > cursor:
+                painter.setPen(normal_pen)
+                start = QPointF(fixed, cursor) if vertical else QPointF(cursor, fixed)
+                end = QPointF(fixed, faded_low) if vertical else QPointF(faded_low, fixed)
+                painter.drawLine(start, end)
+            painter.setPen(faded_pen)
+            fade_start = max(cursor, faded_low)
+            start = QPointF(fixed, fade_start) if vertical else QPointF(fade_start, fixed)
+            end = QPointF(fixed, faded_high) if vertical else QPointF(faded_high, fixed)
+            painter.drawLine(start, end)
+            cursor = faded_high
+        if cursor < high:
+            painter.setPen(normal_pen)
+            start = QPointF(fixed, cursor) if vertical else QPointF(cursor, fixed)
+            end = QPointF(fixed, high) if vertical else QPointF(high, fixed)
+            painter.drawLine(start, end)
+
     for x in range(width):
         px = left + x * step
-        painter.drawLine(QPointF(px, top), QPointF(px, bottom))
+        fade_centers = [
+            bottom - point_y * step
+            for point_x, point_y in faded_points if point_x == x
+        ]
+        draw_line_with_fades(px, top, bottom, fade_centers, vertical=True)
     for row in range(height):
         py = top + row * step
-        painter.drawLine(QPointF(left, py), QPointF(right, py))
+        board_y = height - 1 - row
+        fade_centers = [
+            left + point_x * step
+            for point_x, point_y in faded_points if point_y == board_y
+        ]
+        draw_line_with_fades(py, left, right, fade_centers, vertical=False)
 
     for x, y in _star_points(width, height):
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#342718"))
+        star_color = QColor("#342718")
+        if (x, y) in faded_points:
+            star_color.setAlpha(70)
+        painter.setBrush(star_color)
         painter.drawEllipse(_point(left, bottom, step, x, y), max(2.0, step * 0.09), max(2.0, step * 0.09))
 
     _draw_coordinates(painter, board_rect, left, right, top, bottom, step, width, height)
 
-    radius = step * 0.46
-    stone_players: dict[tuple[int, int], str] = {}
-    for x, y, player, _placed_move_number in frame.stones:
-        stone_players[(x, y)] = player
+    for (x, y), (player, _placed_move_number) in stones.items():
         center = _point(left, bottom, step, x, y)
         if player == "B":
             stone_color = QColor("#222222")
@@ -455,21 +660,28 @@ def paint_sgf_board(
         else:
             stone_color = QColor("#f0eee9")
             outline = QColor("#aaa7a1")
+        is_preview = (x, y) == translucent_point
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(50, 39, 34, 42))
+        painter.setBrush(QColor(50, 39, 34, 24 if is_preview else 42))
         painter.drawEllipse(center + QPointF(radius * 0.07, radius * 0.09), radius, radius)
+        if is_preview:
+            stone_color.setAlpha(150)
+            outline.setAlpha(175)
         painter.setPen(QPen(outline, max(1.0, radius * 0.07)))
         painter.setBrush(stone_color)
         painter.drawEllipse(center, radius, radius)
 
-    if frame.last_move is not None:
+    if _last_move_marker_visible(frame, set(stone_players), annotated_points):
         x, y = frame.last_move
         center = _point(left, bottom, step, x, y)
         painter.setPen(Qt.NoPen)
         painter.setBrush(_annotation_color((x, y), stone_players))
         painter.drawEllipse(center, radius * 0.18, radius * 0.18)
 
-    _draw_markup(painter, frame, left, bottom, step, radius, stone_players)
+    _draw_markup(
+        painter, left, bottom, step, radius, stone_players, shapes, labels,
+        applied_preview_point, annotation_preview,
+    )
 
 
 def render_sgf_board(
@@ -603,9 +815,11 @@ class ReadOnlySgfBoard(QWidget):
         self.saved_start_path: tuple[int, ...] = ()
         self.annotation_tool: str | None = None
         self.edit_tool = "play"
+        self.hovered_point: tuple[int, int] | None = None
         self.setMinimumSize(300, 420)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
 
         self.controls = QWidget(self)
         self.controls.setObjectName("sgfPlaybackControls")
@@ -652,6 +866,9 @@ class ReadOnlySgfBoard(QWidget):
                 lambda checked, name=key: self._select_board_tool(name, checked)
             )
             self.edit_mode_buttons[key] = button
+        self.pass_button = QToolButton()
+        self.pass_button.setText("P")
+        self.pass_button.clicked.connect(self.play_pass)
 
         self.annotation_buttons: dict[str, QToolButton] = {}
         for key, text_value, tooltip in (
@@ -675,7 +892,7 @@ class ReadOnlySgfBoard(QWidget):
             self.next_button, self.forward_ten_button, self.last_button,
         ]
         variation_buttons = [self.variation_previous_button, self.variation_next_button]
-        position_buttons = list(self.edit_mode_buttons.values())
+        position_buttons = [*self.edit_mode_buttons.values(), self.pass_button]
         annotation_buttons = list(self.annotation_buttons.values())
         grouped_buttons = (
             (position_buttons, "#fffafa"),
@@ -690,11 +907,20 @@ class ReadOnlySgfBoard(QWidget):
                 # The panel frame supplies its outside edges. Between groups, the
                 # incoming group supplies one separator and the outgoing group
                 # omits its right edge, preventing doubled or offset lines.
+                is_first_button = group_index == 0 and index == 0
+                is_last_button = (
+                    group_index == len(grouped_buttons) - 1
+                    and index == len(buttons) - 1
+                )
                 left_border = (
                     "2px solid #9fc2d8"
-                    if group_index > 0 and index == 0 else "none"
+                    if is_first_button or (group_index > 0 and index == 0) else "none"
                 )
-                right_border = "1px solid #ddd3d6" if index < len(buttons) - 1 else "none"
+                right_border = (
+                    "2px solid #9fc2d8" if is_last_button
+                    else "1px solid #ddd3d6" if index < len(buttons) - 1
+                    else "none"
+                )
                 button.setStyleSheet(
                     "QToolButton { color: #55464c; border: none; "
                     f"border-left: {left_border}; border-right: {right_border}; "
@@ -725,6 +951,7 @@ class ReadOnlySgfBoard(QWidget):
         # game navigation group; annotations and destructive actions follow it.
         for button in self.edit_mode_buttons.values():
             controls_layout.addWidget(button)
+        controls_layout.addWidget(self.pass_button)
         controls_layout.addWidget(self.variation_previous_button)
         controls_layout.addWidget(self.variation_next_button)
         controls_layout.addWidget(self.first_button)
@@ -820,7 +1047,7 @@ class ReadOnlySgfBoard(QWidget):
                 button.blockSignals(True)
                 button.setChecked(should_be_checked)
                 button.blockSignals(False)
-        self.setCursor(Qt.CrossCursor)
+        self.unsetCursor()
         self.update()
 
     def _node_at_path(self, path: tuple[int, ...]):
@@ -958,6 +1185,20 @@ class ReadOnlySgfBoard(QWidget):
         player = "W" if self._current_player_to_move() == "B" else "B"
         node.set_property("PL", player)
         self._commit_tree_edit(self.current_frame.node_path)
+
+    def play_pass(self) -> None:
+        if not self.playback or not self.current_frame:
+            return
+        node = self._node_at_path(self.current_frame.node_path)
+        if node is None:
+            return
+        player = self._current_player_to_move()
+        child = node.play(Move(player=player, coords=None))
+        child_index = next(
+            index for index, candidate in enumerate(node.ordered_children)
+            if candidate is child
+        )
+        self._commit_tree_edit(self.current_frame.node_path + (child_index,))
 
     def _store_setup_points(self, node, prop: str, points: set[tuple[int, int]]) -> None:
         if not self.playback:
@@ -1157,6 +1398,7 @@ class ReadOnlySgfBoard(QWidget):
         self.refresh_button.setEnabled(frame is not None)
         for button in (*self.edit_mode_buttons.values(), *self.annotation_buttons.values()):
             button.setEnabled(frame is not None)
+        self.pass_button.setEnabled(frame is not None)
         variation = self._variation_context()
         has_variation = variation is not None
         self.variation_previous_button.setEnabled(has_variation)
@@ -1228,26 +1470,49 @@ class ReadOnlySgfBoard(QWidget):
         left, right, top, bottom, step = _grid_geometry(board_rect, self.playback.board_size)
         return board_rect, left, right, top, bottom, step
 
+    def _intersection_at(self, position: QPointF) -> tuple[int, int] | None:
+        if not self.playback:
+            return None
+        geometry = self._board_geometry()
+        if geometry is None:
+            return None
+        _board_rect, left, _right, _top, bottom, step = geometry
+        x = round((position.x() - left) / step)
+        y = round((bottom - position.y()) / step)
+        width, height = self.playback.board_size
+        if not (0 <= x < width and 0 <= y < height):
+            return None
+        center = _point(left, bottom, step, x, y)
+        if (
+            abs(position.x() - center.x()) > step * 0.48
+            or abs(position.y() - center.y()) > step * 0.48
+        ):
+            return None
+        return x, y
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        point = self._intersection_at(event.position())
+        if point != self.hovered_point:
+            self.hovered_point = point
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        if self.hovered_point is not None:
+            self.hovered_point = None
+            self.update()
+        super().leaveEvent(event)
+
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton and self.playback:
-            geometry = self._board_geometry()
-            if geometry is not None:
-                _, left, _, _, bottom, step = geometry
-                x = round((event.position().x() - left) / step)
-                y = round((bottom - event.position().y()) / step)
-                width, height = self.playback.board_size
-                center = _point(left, bottom, step, x, y)
-                close_enough = (
-                    abs(event.position().x() - center.x()) <= step * 0.48
-                    and abs(event.position().y() - center.y()) <= step * 0.48
-                )
-                if 0 <= x < width and 0 <= y < height and close_enough:
-                    if self.annotation_tool:
-                        self._toggle_annotation((x, y))
-                    else:
-                        self._edit_board_point((x, y))
-                    event.accept()
-                    return
+            point = self._intersection_at(event.position())
+            if point is not None:
+                if self.annotation_tool:
+                    self._toggle_annotation(point)
+                else:
+                    self._edit_board_point(point)
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
@@ -1264,4 +1529,15 @@ class ReadOnlySgfBoard(QWidget):
             painter.drawText(media_board_rect, Qt.AlignCenter, message)
             return
 
-        paint_sgf_board(painter, media_board_rect, self.playback, self.current_frame)
+        preview_player = None
+        if self.hovered_point is not None:
+            if self.edit_tool == "play":
+                preview_player = self._current_player_to_move()
+            elif self.edit_tool == "black_setup":
+                preview_player = "B"
+            elif self.edit_tool == "white_setup":
+                preview_player = "W"
+        paint_sgf_board(
+            painter, media_board_rect, self.playback, self.current_frame,
+            self.hovered_point, self.edit_tool, preview_player,
+        )

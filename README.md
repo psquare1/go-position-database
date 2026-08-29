@@ -125,21 +125,30 @@ Choose **New position** to open a blank position in the same editor used for the
 rest of the collection. You can then:
 
 - choose, replace, or paste the main board image;
-- attach, replace, or remove an SGF;
+- create a blank 19×19 SGF, or attach, replace, or remove an SGF;
 - view an attached SGF directly on the large board surface, move through its
   game tree, and inspect its labels and shape annotations;
 - write a description;
-- add tags;
+- add tags, with confirmation before a previously unknown tag is created;
 - record metadata as descriptor/value pairs, such as source, game, move, player,
   difficulty, or review status;
 - add, paste, replace, and remove solution images or board instances; and
 - open the position folder when direct file access is useful.
 
 The editor displays one large item at a time. Use the segmented **Main / S1 / S2**
-selector to move between the main position and its solutions. The adjacent
-**Set baseline** menu can attach an image from a file or the clipboard, store the
-current SGF node, and choose whether an item with both forms displays its image
-or its native SGF board. The visible description belongs to the selected item.
+selector to move between the main position and its solutions, or press
+**Ctrl+Left** / **Ctrl+Right** to select the previous or next item while focus is
+outside a text box. The
+**Set baseline** menu to its left can attach an image from a file or the
+clipboard, store the current SGF node, choose whether an item with both forms
+displays its image or its native SGF board, and delete the selected solution.
+The red **Del** entry removes only the currently selected solution after a
+confirmation; it never deletes the main position. The visible description
+belongs to the selected item.
+
+The header **SGF** menu can choose an SGF from a file, create a blank SGF, or
+remove the current SGF. When no SGF exists, **Create new SGF** takes the place of
+**Current SGF node** in the baseline menu.
 
 When the main position has an SGF, the editor uses that same large display area
 for a native Go board instead of the static main image. The upper square contains
@@ -148,11 +157,20 @@ only the board or image; a divided rectangular toolbar sits below it. Use `<` an
 or `>>` for the ends of the selected line. Left/Right, Page Up/Page Down, Home,
 and End provide the same keyboard navigation. The **V ↑** and **V ↓** buttons—or
 the Up/Down keys—cycle through alternative branches. The stone and eraser tools
-play moves or edit setup stones directly. To annotate the current SGF node,
+play moves or edit setup stones directly; `P` plays a pass for the current player.
+To annotate the current SGF node,
 select `1`, `A`, triangle, circle, square, or cross, then click an intersection.
 Clicking an existing annotation with its matching tool removes it. Number and
 letter labels are assigned in order, while selecting a different markup for the
 same point replaces the old one. These changes use the editor's normal autosave.
+On empty intersections, a small section of the crossing grid lines is faded so
+the annotation remains clear without covering or recoloring the board surface.
+Hovering an intersection previews the selected annotation at reduced opacity or
+the stone that would be played or placed there without changing the normal mouse pointer. A
+matching annotation remains visible rather than previewing its removal. Play-tool
+hover is only a translucent stone overlay on an empty intersection; captures and
+move legality are still evaluated when the board is clicked. The last-move dot is
+hidden when that stone is annotated, erased, or followed by setup-stone additions.
 Board coordinates appear along the top and left edges. Setup stones, passes, and
 captures are replayed. **Refresh** returns to the SGF node stored for the current
 item; **Current SGF node** in the baseline menu replaces that stored node.
@@ -160,7 +178,7 @@ item; **Current SGF node** in the baseline menu replaces that stored node.
 The Solutions menu can add ordinary images or an **Add board** instance. A board
 instance begins at the SGF root and behaves like an independent solution view.
 Navigate to the desired node and click **Set** to store its opening point. Solution
-images and boards remain available through the outer carousel.
+images and boards remain available through the segmented selector.
 
 Changes save automatically after a short pause. They are also flushed when you
 return to Browse or close the app. Deleting
@@ -183,7 +201,10 @@ collection.
 
 A tag can have more than one parent, while cycles are rejected. When tagging a
 position, the app avoids redundant ancestors: adding a more specific descendant
-removes its explicitly stored ancestor.
+removes its explicitly stored ancestor. Changing the hierarchy performs the same
+cleanup across existing positions, including redundancies introduced through an
+indirect ancestor chain. Startup/index maintenance also repairs stale or imported
+records containing unknown, duplicate, or implied ancestor tags.
 
 ## How the collection is stored
 

@@ -16,6 +16,7 @@ from .storage import (
     position_dir,
     position_image_path,
     position_sgf_path,
+    save_position,
 )
 from .tags import TagGraph
 
@@ -63,7 +64,61 @@ class GoPositionDatabase:
             "position_to_expanded_tags": expanded_by_position,
         }
 
+    def cleanup_position_tags(self) -> dict[str, tuple[list[str], list[str]]]:
+        """Remove unknown/redundant tags, canonicalize the rest, and report changes."""
+        graph = self.tag_graph()
+        changes: dict[str, tuple[list[str], list[str]]] = {}
+        for position_id, record in self.all_positions().items():
+            before = list(record.get("tags", []))
+            # Manual edits, imports, or an interrupted historical tag deletion
+            # can leave references whose definitions no longer exist. Discard
+            # those before canonicalizing and removing implied ancestors.
+            known = [tag for tag in before if graph.has(tag)]
+            after = graph.minimal_explicit_tags(known)
+            if after != before:
+                record["tags"] = after
+                save_position(self.config, position_id, record)
+                changes[position_id] = (before, after)
+        return changes
+
+    def delete_tag(self, name: str, *, force: bool = False) -> list[str]:
+        """Delete a tag and its direct position references as one recoverable operation."""
+        graph = self.tag_graph()
+        canonical = graph.canonical(name)
+        positions = self.all_positions()
+        affected: dict[str, dict[str, Any]] = {}
+        updated: dict[str, dict[str, Any]] = {}
+        for position_id, record in positions.items():
+            retained = [
+                tag for tag in record.get("tags", [])
+                if graph.normalize(tag) != graph.normalize(canonical)
+            ]
+            if retained != record.get("tags", []):
+                affected[position_id] = record
+                replacement = dict(record)
+                replacement["tags"] = retained
+                updated[position_id] = replacement
+
+        # Preserve both sides so a later metadata or index write cannot leave a
+        # deleted definition paired with stale position references (or vice versa).
+        tags_backup = {"tags": {key: dict(value or {}) for key, value in graph.entries.items()}}
+        try:
+            graph.remove(canonical, force=force)
+            for position_id, record in updated.items():
+                save_position(self.config, position_id, record)
+            self.rebuild_index()
+        except Exception:
+            atomic_dump_yaml(self.config.tags_file, tags_backup)
+            for position_id, record in affected.items():
+                save_position(self.config, position_id, record)
+            raise
+        return sorted(affected)
+
     def rebuild_index(self) -> dict[str, Any]:
+        # A newly added hierarchy edge can make a formerly explicit ancestor
+        # redundant. Rebuilds are the common path after hierarchy edits, CLI
+        # writes, imports, and startup maintenance, so normalize before indexing.
+        self.cleanup_position_tags()
         data = self.build_index_data()
         atomic_dump_yaml(self.config.index_file, data)
         return data

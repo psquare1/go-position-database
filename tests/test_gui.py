@@ -7,11 +7,13 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtGui import QColor, QPixmap, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPlainTextEdit
 
 from go_position_db.config import Config
+from go_position_db.database import GoPositionDatabase
+from go_position_db.dialogs import SilentMessageBox as QMessageBox
 from go_position_db.gui import (
     DISPLAY_MODES,
     ElidedLabel,
@@ -44,19 +46,17 @@ class GuiTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_gallery_shows_one_image_and_navigates(self):
+    def test_gallery_has_no_carousel_controls(self):
         gallery = PositionImageGallery()
         gallery.set_images([
             ("Main image", QPixmap(QSize(20, 20))),
             ("Solution 1", QPixmap(QSize(20, 20))),
         ])
-        self.assertFalse(gallery.previous_button.isEnabled())
-        self.assertTrue(gallery.next_button.isEnabled())
+        self.assertFalse(hasattr(gallery, "previous_button"))
+        self.assertFalse(hasattr(gallery, "next_button"))
         gallery.select_image(1)
         self.assertEqual(gallery.selected_index, 1)
-        self.assertIn("Solution 1", gallery.position_label.text())
-        self.assertTrue(gallery.previous_button.isEnabled())
-        self.assertFalse(gallery.next_button.isEnabled())
+        self.assertIs(gallery.media_stack.currentWidget(), gallery.image_surface)
 
     def test_tag_filter_selects_creates_and_description_autosaves(self):
         manager = TagManagerPage(self.cfg)
@@ -71,6 +71,52 @@ class GuiTests(unittest.TestCase):
         manager.select_or_create_filter_tag()
         self.assertEqual(manager._current_tag(), "new-tag")
         self.assertTrue(TagGraph(self.cfg).has("new-tag"))
+
+    def test_tag_manager_delete_refreshes_and_removes_position_references(self):
+        position_id = "p000010"
+        directory = self.cfg.positions_dir / position_id
+        directory.mkdir()
+        save_position(self.cfg, position_id, {
+            "description": "",
+            "score": "",
+            "tags": ["joseki"],
+            "metadata": {},
+            "solution_images": [],
+        })
+        manager = TagManagerPage(self.cfg)
+        manager.refresh()
+        item = manager.tag_list.findItems("joseki", Qt.MatchExactly)[0]
+        manager.tag_list.setCurrentItem(item)
+
+        with patch(
+            "go_position_db.gui.QMessageBox.question",
+            return_value=QMessageBox.Yes,
+        ) as confirmation:
+            manager.delete_tag()
+
+        self.assertIn("removed from 1 directly tagged position", confirmation.call_args.args[2])
+        self.assertFalse(TagGraph(self.cfg).has("joseki"))
+        self.assertEqual(load_position(self.cfg, position_id)["tags"], [])
+        self.assertFalse(manager.tag_list.findItems("joseki", Qt.MatchExactly))
+        self.assertIsNone(manager.loaded_tag_name)
+
+        # The same index operation used by New Position must remain valid.
+        GoPositionDatabase(self.cfg).rebuild_index()
+
+    def test_tag_manager_deletes_unused_tag_without_confirmation(self):
+        graph = TagGraph(self.cfg)
+        graph.add("unused-tag")
+        GoPositionDatabase(self.cfg).rebuild_index()
+        manager = TagManagerPage(self.cfg)
+        manager.refresh()
+        item = manager.tag_list.findItems("unused-tag", Qt.MatchExactly)[0]
+        manager.tag_list.setCurrentItem(item)
+
+        with patch("go_position_db.gui.QMessageBox.question") as confirmation:
+            manager.delete_tag()
+
+        confirmation.assert_not_called()
+        self.assertFalse(TagGraph(self.cfg).has("unused-tag"))
 
     def test_untouched_new_position_is_discarded(self):
         position_id = "p000001"
@@ -155,11 +201,24 @@ class GuiTests(unittest.TestCase):
             editor.add_from_edit()
         self.assertEqual(editor.tags(), ["3-3-joseki"])
 
-        with patch("go_position_db.gui.QMessageBox.information"):
+        with patch(
+            "go_position_db.gui.QMessageBox.question",
+            return_value=QMessageBox.Yes,
+        ) as confirm_create:
             editor.add_edit.setText("fresh_tag")
             editor.add_from_edit()
+        confirm_create.assert_called_once()
         self.assertIn("fresh-tag", editor.tags())
         self.assertTrue(TagGraph(self.cfg).has("fresh-tag"))
+
+        with patch(
+            "go_position_db.gui.QMessageBox.question",
+            return_value=QMessageBox.Cancel,
+        ):
+            editor.add_edit.setText("not-created")
+            editor.add_from_edit()
+        self.assertNotIn("not-created", editor.tags())
+        self.assertFalse(TagGraph(self.cfg).has("not-created"))
 
     def test_standard_view_uses_three_columns(self):
         self.assertEqual(DISPLAY_MODES["Standard"].columns, 3)
@@ -186,7 +245,24 @@ class GuiTests(unittest.TestCase):
         QTest.keyClick(query, Qt.Key_Return)
         self.assertEqual(searches, [query.text()])
         self.app.processEvents()
-        self.assertFalse(query.grab().isNull())
+        query_image = query.grab().toImage()
+        self.assertFalse(query_image.isNull())
+        # Recognized tags are painted once in rose. The previous overlay approach
+        # left a second, dark copy of each glyph underneath and offset from it.
+        neutral_dark_pixels = 0
+        rose_pixels = 0
+        for y in range(5, query_image.height() - 5):
+            for x in range(5, min(180, query_image.width() - 5)):
+                color = query_image.pixelColor(x, y)
+                if max(color.red(), color.green(), color.blue()) < 180:
+                    if max(color.red(), color.green(), color.blue()) - min(
+                        color.red(), color.green(), color.blue()
+                    ) < 18:
+                        neutral_dark_pixels += 1
+                    elif color.red() > color.green() + 25:
+                        rose_pixels += 1
+        self.assertGreater(rose_pixels, 0)
+        self.assertLess(neutral_dark_pixels, 250)
 
         tags = TagChipDisplay(["joseki", "reverse-sente"], centered=True)
         self.assertEqual(tags.height(), 56)
@@ -269,6 +345,13 @@ class GuiTests(unittest.TestCase):
         self.assertIs(editor.image_gallery.media_stack.currentWidget(), board)
         self.assertEqual(editor.baseline_menu_button.text(), "Set baseline")
         self.assertEqual(editor.baseline_menu_button.toolTip(), "Selected baseline: board")
+        self.assertEqual(
+            {
+                action.text() for action in editor.sgf_menu_btn.menu().actions()
+                if action.text()
+            },
+            {"Choose SGF from file…", "Create new SGF", "Remove SGF…"},
+        )
         baseline_actions = {
             action.text(): action
             for action in editor.baseline_menu_button.menu().actions()
@@ -279,7 +362,16 @@ class GuiTests(unittest.TestCase):
             {
                 "Image from file…", "Image from clipboard", "Current SGF node",
                 "Display SGF board", "Display image",
+                "Del — remove selected solution…",
             },
+        )
+        delete_solution_action = baseline_actions["Del — remove selected solution…"]
+        self.assertTrue(delete_solution_action.isEnabled())
+        self.assertIn("main position is not deleted", delete_solution_action.toolTip())
+        self.assertIn("background: #f6c7cf", delete_solution_action.defaultWidget().styleSheet())
+        self.assertGreaterEqual(
+            sum(action.isSeparator() for action in editor.baseline_menu_button.menu().actions()),
+            3,
         )
         self.assertTrue(baseline_actions["Display SGF board"].isChecked())
         self.assertFalse(baseline_actions["Display image"].isEnabled())
@@ -317,26 +409,54 @@ class GuiTests(unittest.TestCase):
         editor.resize(1500, 900)
         editor.show()
         self.app.processEvents()
+        self.assertEqual(editor.image_panel.geometry().top(), editor.details_panel.geometry().top())
+        self.assertEqual(editor.image_panel.geometry().bottom(), editor.details_panel.geometry().bottom())
+        self.assertGreater(editor.image_panel.width(), editor.details_panel.width())
+        board_outer, _board_media, _board_controls = (
+            editor.image_gallery.sgf_board._content_rects()
+        )
+        self.assertLessEqual(board_outer.top(), 3)
+        self.assertLessEqual(
+            editor.image_gallery.sgf_board.height() - board_outer.bottom(), 3
+        )
         solution_controls_geometry = editor.solution_controls.geometry()
         initial_strip_left = editor.solution_strip.geometry().left()
         initial_strip_width = editor.solution_strip.width()
         initial_baseline_left = editor.baseline_menu_button.geometry().left()
+        self.assertLess(initial_baseline_left, editor.solution_strip_slot.geometry().left())
         self.assertEqual(editor.solution_strip.height(), 40)
         self.assertTrue(all(button.height() == 34 for button in editor.solution_tab_buttons))
         self.assertEqual(editor.sgf_menu_btn.size(), editor.open_folder_btn.size())
         self.assertEqual(editor.open_folder_btn.size(), editor.delete_btn.size())
         self.assertEqual(editor.back_btn.height(), editor.sgf_menu_btn.height())
         self.assertEqual(editor.baseline_menu_button.height(), editor.sgf_menu_btn.height())
-        self.assertEqual(editor.solution_delete_button.height(), editor.sgf_menu_btn.height())
         editor.refresh_gallery(0)
         self.app.processEvents()
         self.assertEqual(editor.solution_controls.geometry(), solution_controls_geometry)
-        self.assertEqual(editor.solution_delete_button.text(), "")
-        self.assertFalse(editor.solution_delete_button.isEnabled())
+        main_actions = {
+            action.text(): action
+            for action in editor.baseline_menu_button.menu().actions()
+            if action.text()
+        }
+        self.assertFalse(main_actions["Del — remove selected solution…"].isEnabled())
         editor.refresh_gallery(1)
         self.app.processEvents()
         self.assertEqual(editor.solution_controls.geometry(), solution_controls_geometry)
-        self.assertEqual(editor.solution_delete_button.text(), "Del")
+        editor.image_gallery.sgf_board.setFocus()
+        self.app.processEvents()
+        QTest.keyClick(editor.image_gallery.sgf_board, Qt.Key_Left, Qt.ControlModifier)
+        self.assertEqual(editor.selected_image_index, 0)
+        QTest.keyClick(editor.image_gallery.sgf_board, Qt.Key_Right, Qt.ControlModifier)
+        self.assertEqual(editor.selected_image_index, 1)
+        editor.description_edit.setFocus()
+        editor.description_edit.setPlainText("two words")
+        editor.description_edit.moveCursor(QTextCursor.End)
+        self.app.processEvents()
+        QTest.keyClick(editor.description_edit, Qt.Key_Left, Qt.ControlModifier)
+        self.assertEqual(editor.selected_image_index, 1)
+        self.assertLess(
+            editor.description_edit.textCursor().position(), len("two words")
+        )
         self.assertTrue(editor.save_current())
         self.assertIn("TR[ai]", sgf_path.read_text(encoding="utf-8"))
         saved = load_position(self.cfg, position_id)
@@ -355,6 +475,56 @@ class GuiTests(unittest.TestCase):
         self.assertGreater(editor.solution_strip.width(), initial_strip_width)
         self.assertLessEqual(editor.solution_strip.width(), editor.solution_strip_slot.width())
         self.assertEqual(editor.baseline_menu_button.geometry().left(), initial_baseline_left)
+
+    def test_position_without_sgf_offers_creation_from_both_menus(self):
+        position_id = "p000002"
+        directory = self.cfg.positions_dir / position_id
+        directory.mkdir()
+        save_position(self.cfg, position_id, {
+            "description": "",
+            "score": "",
+            "tags": [],
+            "metadata": {},
+            "solution_images": [],
+        })
+
+        editor = PositionEditor(self.cfg)
+        self.assertTrue(editor.load_position(position_id))
+        baseline_actions = {
+            action.text(): action
+            for action in editor.baseline_menu_button.menu().actions()
+            if action.text()
+        }
+        self.assertIn("Create new SGF", baseline_actions)
+        self.assertNotIn("Current SGF node", baseline_actions)
+        self.assertEqual(
+            {
+                action.text() for action in editor.sgf_menu_btn.menu().actions()
+                if action.text()
+            },
+            {"Choose SGF from file…", "Create new SGF"},
+        )
+
+        baseline_actions["Create new SGF"].trigger()
+        self.assertIsNotNone(editor.pending_sgf_text)
+        self.assertIsNotNone(editor.image_gallery.sgf_board.current_frame)
+        self.assertIn(
+            "Current SGF node",
+            {
+                action.text() for action in editor.baseline_menu_button.menu().actions()
+                if action.text()
+            },
+        )
+        self.assertIn(
+            "Remove SGF…",
+            {
+                action.text() for action in editor.sgf_menu_btn.menu().actions()
+                if action.text()
+            },
+        )
+        self.assertTrue(editor.save_current())
+        self.assertTrue((directory / self.cfg.sgf_filename).exists())
+        editor.close()
 
 
 if __name__ == "__main__":

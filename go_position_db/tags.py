@@ -142,6 +142,17 @@ class TagGraph:
             out.update(self.ancestors(tag, include_self=True))
         return out
 
+    def minimal_explicit_tags(self, tags: Iterable[str]) -> list[str]:
+        """Canonicalize tags and remove ancestors implied by another explicit tag."""
+        canonical = list(dict.fromkeys(self.canonical(tag) for tag in tags))
+        return [
+            tag for tag in canonical
+            if not any(
+                tag in self.ancestors(other, include_self=False)
+                for other in canonical if other != tag
+            )
+        ]
+
     def validate(self) -> list[str]:
         errors: list[str] = []
         for tag in self.names():

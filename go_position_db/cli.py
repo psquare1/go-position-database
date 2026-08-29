@@ -135,7 +135,7 @@ def _meta_pairs(items: list[str]) -> dict[str, Any]:
 
 
 def _canonicalize_tags(graph: TagGraph, tags: list[str]) -> list[str]:
-    return list(dict.fromkeys(graph.canonical(tag) for tag in tags))
+    return graph.minimal_explicit_tags(tags)
 
 
 def _ensure_root_files(root: Path, force: bool) -> None:
@@ -252,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         if pc == "create":
             tags = _canonicalize_tags(graph, args.tag)
             create_position(config, args.position_id, args.sgf, args.image, args.description, tags, _meta_pairs(args.meta))
+            db.rebuild_index()
             print(f"Created position {args.position_id}")
             return 0
 
@@ -274,19 +275,23 @@ def main(argv: list[str] | None = None) -> int:
             for tag in _canonicalize_tags(graph, args.tags):
                 if tag not in existing:
                     existing.append(tag)
+            existing = graph.minimal_explicit_tags(existing)
             rec["tags"] = existing
             save_position(config, args.position_id, rec)
+            db.rebuild_index()
             print(f"Tags for {args.position_id}: {', '.join(existing) or '(none)'}")
             return 0
         if pc == "remove-tag":
             remove = {graph.normalize(graph.canonical(t)) for t in args.tags}
             rec["tags"] = [t for t in rec["tags"] if graph.normalize(t) not in remove]
             save_position(config, args.position_id, rec)
+            db.rebuild_index()
             print(f"Tags for {args.position_id}: {', '.join(rec['tags']) or '(none)'}")
             return 0
         if pc == "set-tags":
             rec["tags"] = _canonicalize_tags(graph, args.tags)
             save_position(config, args.position_id, rec)
+            db.rebuild_index()
             print(f"Tags for {args.position_id}: {', '.join(rec['tags']) or '(none)'}")
             return 0
         if pc == "set-description":
@@ -319,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if tc == "add":
             graph.add(args.name, args.parent, args.description)
+            db.rebuild_index()
             print(f"Added tag {args.name}")
             return 0
         if tc == "remove":
@@ -331,14 +337,17 @@ def main(argv: list[str] | None = None) -> int:
             if refs:
                 raise DatabaseError(f"Tag '{canonical}' is still explicitly used by positions: {', '.join(refs)}")
             graph.remove(args.name, args.force)
+            db.rebuild_index()
             print(f"Removed tag {canonical}")
             return 0
         if tc == "add-parent":
             graph.add_parent(args.name, args.parent)
+            db.rebuild_index()
             print(f"Added parent {args.parent} -> {args.name}")
             return 0
         if tc == "remove-parent":
             graph.remove_parent(args.name, args.parent)
+            db.rebuild_index()
             print(f"Removed parent {args.parent} -> {args.name}")
             return 0
 

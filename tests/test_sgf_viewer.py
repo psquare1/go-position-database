@@ -2,11 +2,12 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
+from PySide6.QtGui import QImage, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QToolButton
 from PySide6.QtTest import QTest
 
@@ -15,7 +16,11 @@ from go_position_db.sgf_viewer import (
     COORD_ROOM_RATIO,
     STONE_ROOM_RATIO,
     ReadOnlySgfBoard,
+    _effective_markup,
+    _last_move_marker_visible,
     load_sgf_playback,
+    load_sgf_text,
+    paint_sgf_board,
     render_sgf_board,
 )
 
@@ -129,10 +134,12 @@ class SgfViewerTests(unittest.TestCase):
             ["play", "black_setup", "white_setup", "erase"],
         )
         self.assertTrue(board.edit_mode_buttons["play"].isChecked())
-        self.assertIn("border-left: none", board.edit_mode_buttons["play"].styleSheet())
-        self.assertIn("border-right: none", board.edit_mode_buttons["erase"].styleSheet())
+        self.assertEqual(board.pass_button.text(), "P")
+        self.assertTrue(board.pass_button.isEnabled())
+        self.assertIn("border-left: 2px solid #9fc2d8", board.edit_mode_buttons["play"].styleSheet())
+        self.assertIn("border-right: none", board.pass_button.styleSheet())
         self.assertIn("border-left: 2px solid #9fc2d8", board.variation_previous_button.styleSheet())
-        self.assertIn("border-right: none", board.refresh_button.styleSheet())
+        self.assertIn("border-right: 2px solid #9fc2d8", board.refresh_button.styleSheet())
         self.assertIn("border-left", board.first_button.styleSheet())
         self.assertTrue(all(
             "border-bottom" in button.styleSheet()
@@ -201,6 +208,83 @@ class SgfViewerTests(unittest.TestCase):
         self.assertTrue(reloaded.load_text(edits[-1], [0, 1]))
         self.assertIn((1, 0, "2"), reloaded.current_frame.labels)
 
+    def test_hover_keeps_matching_annotations_and_play_preview_skips_rules(self):
+        playback = load_sgf_playback(self.sgf_path, [0, 0])
+        frame = playback.frames_by_path[(0, 0)]
+
+        shapes, labels = _effective_markup(frame, (1, 2), "triangles")
+        self.assertIn((1, 2), shapes["triangles"])
+        shapes, labels = _effective_markup(frame, (2, 2), "numbers")
+        self.assertIn((2, 2, "1"), labels)
+
+        # A different tool still previews the successful replacement result.
+        shapes, _labels = _effective_markup(frame, (1, 2), "circles")
+        self.assertNotIn((1, 2), shapes["triangles"])
+        self.assertIn((1, 2), shapes["circles"])
+
+        baseline = QImage(240, 240, QImage.Format_ARGB32)
+        painter = QPainter(baseline)
+        try:
+            paint_sgf_board(
+                painter, QRectF(0, 0, 240, 240), playback, frame
+            )
+        finally:
+            painter.end()
+
+        occupied_preview = QImage(240, 240, QImage.Format_ARGB32)
+        painter = QPainter(occupied_preview)
+        try:
+            with patch(
+                "go_position_db.sgf_viewer._play_move",
+                side_effect=AssertionError("hover must not run move legality/capture logic"),
+            ):
+                paint_sgf_board(
+                    painter,
+                    QRectF(0, 0, 240, 240),
+                    playback,
+                    frame,
+                    preview_point=(1, 2),  # Already occupied by Black.
+                    preview_tool="play",
+                    preview_player="W",
+                )
+        finally:
+            painter.end()
+        self.assertEqual(occupied_preview, baseline)
+
+        empty_preview = QImage(240, 240, QImage.Format_ARGB32)
+        painter = QPainter(empty_preview)
+        try:
+            with patch(
+                "go_position_db.sgf_viewer._play_move",
+                side_effect=AssertionError("hover must not run move legality/capture logic"),
+            ):
+                paint_sgf_board(
+                    painter,
+                    QRectF(0, 0, 240, 240),
+                    playback,
+                    frame,
+                    preview_point=(4, 4),
+                    preview_tool="play",
+                    preview_player="W",
+                )
+        finally:
+            painter.end()
+        self.assertNotEqual(empty_preview, baseline)
+
+    def test_pass_button_adds_a_pass_for_the_current_player(self):
+        board = ReadOnlySgfBoard()
+        self.assertTrue(board.load_text("(;GM[1]FF[4]SZ[9])"))
+        edits = []
+        board.sgf_edited.connect(edits.append)
+
+        board.pass_button.click()
+
+        self.assertEqual(board.current_frame.move_number, 1)
+        self.assertIsNone(board.current_frame.last_move)
+        self.assertEqual(board.current_frame.last_player, "B")
+        self.assertTrue(edits)
+        self.assertIn("B[]", edits[-1])
+
     def test_play_setup_erase_and_side_to_move_edit_the_sgf(self):
         board = ReadOnlySgfBoard()
         self.assertTrue(board.load_file(self.sgf_path))
@@ -237,6 +321,52 @@ class SgfViewerTests(unittest.TestCase):
         self.assertEqual(board.current_frame.node_path, ())
         self.assertFalse(board.delete_node_button.isEnabled())
         self.assertTrue(edits)
+
+    def test_erasing_the_last_move_clears_its_highlight_and_hover_keeps_arrow_cursor(self):
+        board = ReadOnlySgfBoard()
+        self.assertTrue(board.load_text("(;GM[1]FF[4]SZ[9];B[ee])", [0]))
+        self.assertEqual(board.current_frame.last_move, (4, 4))
+        board.edit_mode_buttons["erase"].click()
+        self.assertEqual(board.cursor().shape(), Qt.ArrowCursor)
+        board._edit_board_point((4, 4))
+        self.assertIsNone(board.current_frame.last_move)
+        self.assertNotIn(
+            (4, 4), {(x, y) for x, y, _player, _number in board.current_frame.stones}
+        )
+
+        board.annotation_buttons["triangles"].click()
+        board.resize(620, 700)
+        board.show()
+        self.app.processEvents()
+        _rect, left, _right, _top, bottom, step = board._board_geometry()
+        point = board._intersection_at(
+            QPointF(left + 2 * step, bottom - 2 * step)
+        )
+        self.assertEqual(point, (2, 2))
+        board.hovered_point = point
+        board.update()
+        self.app.processEvents()
+        self.assertEqual(board.hovered_point, (2, 2))
+        self.assertEqual(board.cursor().shape(), Qt.ArrowCursor)
+        board.close()
+
+    def test_last_move_highlight_is_hidden_by_annotation_or_setup_stones(self):
+        plain = load_sgf_text("(;GM[1]FF[4]SZ[9];B[ee])", [0])
+        annotated = load_sgf_text("(;GM[1]FF[4]SZ[9];B[ee]TR[ee])", [0])
+        setup = load_sgf_text("(;GM[1]FF[4]SZ[9];B[ee];AB[aa]AW[ii])", [0, 0])
+
+        plain_frame = plain.frames[plain.start_frame_index]
+        annotated_frame = annotated.frames[annotated.start_frame_index]
+        setup_frame = setup.frames[setup.start_frame_index]
+        stones = {(4, 4)}
+
+        self.assertTrue(_last_move_marker_visible(plain_frame, stones, set()))
+        self.assertFalse(
+            _last_move_marker_visible(annotated_frame, stones, {(4, 4)})
+        )
+        self.assertTrue(setup_frame.has_setup_stones)
+        self.assertFalse(_last_move_marker_visible(setup_frame, stones, set()))
+
 
     def test_render_sgf_board_thumbnail_for_search_results(self):
         thumb = render_sgf_board(self.sgf_path, [0, 0], size=200)
