@@ -111,7 +111,7 @@ def clean_position_files(config: Config, position_id: str, dry_run: bool = False
     """Normalize arbitrary SGF/image names while preserving the image's real extension."""
     d = position_dir(config, position_id)
     if not d.exists():
-        raise DatabaseError(f"No position '{position_id}' ({d} does not exist).")
+        raise DatabaseError(f"No entry '{position_id}' ({d} does not exist).")
 
     actions: list[str] = []
 
@@ -197,7 +197,7 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
     if value is None:
         value = {}
     if not isinstance(value, dict):
-        raise DatabaseError("Position metadata must be a YAML mapping.")
+        raise DatabaseError("Entry metadata must be a YAML mapping.")
     result = dict(value)
     # Position folders are the user-facing identifiers; discard the retired name field.
     result.pop("name", None)
@@ -209,53 +209,53 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
     result.setdefault("metadata", {})
     result.setdefault("solution_images", [])
     if not isinstance(result["description"], str):
-        raise DatabaseError("Position 'description' must be a string.")
+        raise DatabaseError("Entry 'description' must be a string.")
     normalized_score = formatted_score(result["score"])
     if normalized_score:
         result["score"] = normalized_score
     elif not isinstance(result["score"], str):
-        raise DatabaseError("Position 'score' must be a score string or a positive/negative number.")
+        raise DatabaseError("Entry 'score' must be a score string or a positive/negative number.")
     if result["main_media_kind"] not in {"board", "image"}:
-        raise DatabaseError("Position 'main_media_kind' must be 'board' or 'image'.")
+        raise DatabaseError("Entry 'main_media_kind' must be 'board' or 'image'.")
     result["sgf_start_path"] = normalized_sgf_start_path(
-        result["sgf_start_path"], "Position 'sgf_start_path'"
+        result["sgf_start_path"], "Entry 'sgf_start_path'"
     )
     if not isinstance(result["tags"], list) or not all(isinstance(x, str) for x in result["tags"]):
-        raise DatabaseError("Position 'tags' must be a list of strings.")
+        raise DatabaseError("Entry 'tags' must be a list of strings.")
     # Import lazily to keep storage and tag-graph module initialization independent.
     from .tags import validate_new_tag_name
     result["tags"] = [validate_new_tag_name(tag) for tag in result["tags"]]
     if not isinstance(result["metadata"], dict):
-        raise DatabaseError("Position 'metadata' must be a mapping.")
+        raise DatabaseError("Entry 'metadata' must be a mapping.")
     if not isinstance(result["solution_images"], list):
-        raise DatabaseError("Position 'solution_images' must be a list.")
+        raise DatabaseError("Entry 'solution_images' must be a list.")
     normalized_solutions: list[dict[str, Any]] = []
     for index, item in enumerate(result["solution_images"], start=1):
         if not isinstance(item, dict):
-            raise DatabaseError(f"Solution image {index} must be a mapping.")
+            raise DatabaseError(f"Variation {index} must be a mapping.")
         kind = item.get("kind", "image")
         file_value = item.get("file", "")
         description = item.get("description", "")
         score = item.get("score", "")
         sgf_start_path = normalized_sgf_start_path(
-            item.get("sgf_start_path", []), f"Solution image {index} 'sgf_start_path'"
+            item.get("sgf_start_path", []), f"Variation {index} 'sgf_start_path'"
         )
         if kind not in {"image", "board"}:
-            raise DatabaseError(f"Solution {index} kind must be 'image' or 'board'.")
+            raise DatabaseError(f"Variation {index} kind must be 'image' or 'board'.")
         if not isinstance(file_value, str):
-            raise DatabaseError(f"Solution {index} file path must be a string.")
+            raise DatabaseError(f"Variation {index} file path must be a string.")
         if kind == "image" and not file_value.strip():
-            raise DatabaseError(f"Solution image {index} needs a file path.")
+            raise DatabaseError(f"Variation {index} needs a file path.")
         relative = Path(file_value) if file_value else None
         if relative is not None and (relative.is_absolute() or ".." in relative.parts):
-            raise DatabaseError(f"Solution image {index} file path must stay inside the position folder.")
+            raise DatabaseError(f"Variation {index} file path must stay inside the entry folder.")
         if not isinstance(description, str):
-            raise DatabaseError(f"Solution image {index} description must be a string.")
+            raise DatabaseError(f"Variation {index} description must be a string.")
         normalized_solution_score = formatted_score(score)
         if normalized_solution_score:
             score = normalized_solution_score
         elif not isinstance(score, str):
-            raise DatabaseError(f"Solution image {index} score must be a score string or a positive/negative number.")
+            raise DatabaseError(f"Variation {index} score must be a score string or a positive/negative number.")
         normalized_solutions.append({
             "kind": kind,
             "file": relative.as_posix() if relative is not None else "",
@@ -270,7 +270,7 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
 def load_position(config: Config, position_id: str) -> dict[str, Any]:
     path = position_metadata_path(config, position_id)
     if not path.exists():
-        raise DatabaseError(f"No position '{position_id}' ({path} does not exist).")
+        raise DatabaseError(f"No entry '{position_id}' ({path} does not exist).")
     return normalize_position_record(load_yaml(path, {}))
 
 
@@ -342,7 +342,7 @@ def create_position(
 ) -> None:
     dest = position_dir(config, position_id)
     if dest.exists():
-        raise DatabaseError(f"Position '{position_id}' already exists.")
+        raise DatabaseError(f"Entry '{position_id}' already exists.")
     if sgf is None and image is None:
         raise DatabaseError("At least one of --sgf or --image must be provided.")
     if sgf is not None and not sgf.exists():

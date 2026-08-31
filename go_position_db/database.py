@@ -168,7 +168,7 @@ class GoPositionDatabase:
                 if not any(str(e) in existing for existing in errors):
                     errors.append(f"{position_id}: {e}")
             if not media_resolution_failed and image is None and sgf is None:
-                errors.append(f"{position_id}: missing main image or SGF")
+                errors.append(f"{position_id}: missing primary image or SGF")
             if not meta.exists():
                 errors.append(f"{position_id}: missing {self.config.metadata_filename}")
                 continue
@@ -182,9 +182,9 @@ class GoPositionDatabase:
                     continue
                 solution_path = d / solution["file"]
                 if not solution_path.exists():
-                    errors.append(f"{position_id}: missing solution image {solution_index} ({solution['file']})")
+                    errors.append(f"{position_id}: missing variation image {solution_index} ({solution['file']})")
                 elif solution_path.suffix.lower() not in self.config.image_extensions:
-                    errors.append(f"{position_id}: unsupported solution image extension ({solution['file']})")
+                    errors.append(f"{position_id}: unsupported variation image extension ({solution['file']})")
             seen: set[str] = set()
             for tag in record["tags"]:
                 key = graph.normalize(tag)

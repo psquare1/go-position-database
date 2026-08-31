@@ -80,11 +80,11 @@ class CoreTests(unittest.TestCase):
         d = self.cfg.positions_dir / "p2"
         (d / self.cfg.sgf_filename).unlink()
         db = GoPositionDatabase(self.cfg)
-        self.assertFalse(any("p2: missing main image or SGF" in error for error in db.check()))
+        self.assertFalse(any("p2: missing primary image or SGF" in error for error in db.check()))
 
         (d / self.cfg.image_filename).unlink()
         errors = db.check()
-        self.assertTrue(any("p2: missing main image or SGF" in error for error in errors))
+        self.assertTrue(any("p2: missing primary image or SGF" in error for error in errors))
 
     def test_cycle_detection(self):
         from go_position_db.storage import DatabaseError

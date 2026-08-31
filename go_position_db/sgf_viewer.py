@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any
 
@@ -223,6 +224,97 @@ def load_sgf_playback(path: Path, start_path: list[int] | tuple[int, ...] = ()) 
 
 def load_sgf_text(text: str, start_path: list[int] | tuple[int, ...] = ()) -> SgfPlayback:
     return _playback_from_root(GoGame.parse(text), start_path)
+
+
+def insert_setup_position(
+    sgf_text: str | None,
+    board_size: int,
+    black: set[tuple[int, int]] | frozenset[tuple[int, int]],
+    white: set[tuple[int, int]] | frozenset[tuple[int, int]],
+    parent_path: list[int] | tuple[int, ...] = (),
+    player_to_move: str = "B",
+    komi: float = 6.5,
+) -> tuple[str, list[int]]:
+    """Create a setup SGF or append an absolute position as a child variation.
+
+    Existing stones that are absent from the recognized position are removed
+    with AE. Added or recolored stones use AB/AW; no chronological moves are
+    invented from the static image.
+    """
+    if not isinstance(board_size, int) or isinstance(board_size, bool) or not 2 <= board_size <= 52:
+        raise ValueError("Board size must be an integer from 2 through 52.")
+    if player_to_move not in {"B", "W"}:
+        raise ValueError("Player to move must be B or W.")
+    if (
+        not isinstance(komi, (int, float))
+        or isinstance(komi, bool)
+        or not math.isfinite(komi)
+        or not -400 <= komi <= 400
+        or not float(komi * 2).is_integer()
+    ):
+        raise ValueError("Komi must be an integer or half-integer from -400 through 400.")
+    black_points = set(black)
+    white_points = set(white)
+    if black_points & white_points:
+        raise ValueError("A setup intersection cannot be both black and white.")
+    for point in black_points | white_points:
+        if (
+            not isinstance(point, tuple)
+            or len(point) != 2
+            or not all(isinstance(value, int) and not isinstance(value, bool) for value in point)
+            or not all(0 <= value < board_size for value in point)
+        ):
+            raise ValueError(f"Invalid setup coordinate: {point!r}")
+
+    def values(points: set[tuple[int, int]]) -> list[str]:
+        return [Move(coords=point).sgf(board_size=(board_size, board_size)) for point in sorted(points)]
+
+    if sgf_text is None:
+        root = GoGame.parse(
+            f"(;GM[1]FF[4]CA[UTF-8]AP[Go Position DB]SZ[{board_size}])"
+        ).root
+        if black_points:
+            root.set_property("AB", values(black_points))
+        if white_points:
+            root.set_property("AW", values(white_points))
+        root.set_property("PL", player_to_move)
+        root.set_property("KM", komi)
+        return root.sgf(), []
+
+    playback = load_sgf_text(sgf_text, parent_path)
+    if playback.board_size != (board_size, board_size):
+        width, height = playback.board_size
+        raise ValueError(
+            f"The image was recognized as {board_size}x{board_size}, but the SGF board is {width}x{height}."
+        )
+    requested_path = tuple(parent_path)
+    if not playback.start_path_valid:
+        raise ValueError("The selected SGF starting-view node no longer exists.")
+    parent = playback.root
+    for child_index in requested_path:
+        parent = parent.ordered_children[child_index]
+    playback.root.set_property("KM", komi)
+    parent_frame = playback.frames_by_path[requested_path]
+    current = {(x, y): player for x, y, player, _number in parent_frame.stones}
+    recognized = {point: "B" for point in black_points}
+    recognized.update({point: "W" for point in white_points})
+    erased = set(current) - set(recognized)
+    add_black = {point for point in black_points if current.get(point) != "B"}
+    add_white = {point for point in white_points if current.get(point) != "W"}
+
+    child = type(parent)(parent=parent)
+    child.set_property("PL", player_to_move)
+    if erased:
+        child.set_property("AE", values(erased))
+    if add_black:
+        child.set_property("AB", values(add_black))
+    if add_white:
+        child.set_property("AW", values(add_white))
+    child_index = next(
+        index for index, candidate in enumerate(parent.ordered_children) if candidate is child
+    )
+    result_path = [*requested_path, child_index]
+    return playback.root.sgf(), result_path
 
 
 def media_card_rects(

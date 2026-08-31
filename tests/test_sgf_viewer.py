@@ -18,6 +18,7 @@ from go_position_db.sgf_viewer import (
     ReadOnlySgfBoard,
     _effective_markup,
     _last_move_marker_visible,
+    insert_setup_position,
     load_sgf_playback,
     load_sgf_text,
     paint_sgf_board,
@@ -75,6 +76,45 @@ class SgfViewerTests(unittest.TestCase):
         secondary = secondary_playback.frames_by_path[(0, 1)]
         self.assertEqual(secondary.node_path, (0, 1))
         self.assertIn((3, 1, "W", 2), secondary.stones)
+
+    def test_setup_position_creates_new_sgf_with_ab_and_aw(self):
+        text, path = insert_setup_position(
+            None, 9, {(0, 0), (4, 4)}, {(8, 8)}, [], "W", 7.5
+        )
+        self.assertEqual(path, [])
+        self.assertIn("AB[ai][ee]", text)
+        self.assertIn("AW[ia]", text)
+        self.assertIn("PL[W]", text)
+        self.assertIn("KM[7.5]", text)
+        self.assertNotIn(";B[", text)
+        self.assertNotIn(";W[", text)
+        frame = load_sgf_text(text).frames_by_path[()]
+        stones = {(x, y): player for x, y, player, _number in frame.stones}
+        self.assertEqual(stones, {(0, 0): "B", (4, 4): "B", (8, 8): "W"})
+
+    def test_setup_position_adds_alternate_branch_and_preserves_tree(self):
+        original = "(;GM[1]FF[4]SZ[9]C[root];B[aa](;W[bb]C[existing]))"
+        text, path = insert_setup_position(
+            original, 9, {(2, 2)}, {(3, 3)}, [0], "W", 0.5
+        )
+        self.assertEqual(path, [0, 1])
+        self.assertIn("C[existing]", text)
+        playback = load_sgf_text(text, path)
+        self.assertIn((0, 8), {
+            (x, y) for x, y, _player, _number in playback.frames_by_path[(0, 0)].stones
+        })
+        self.assertEqual(playback.children_of((0,)), ((0, 0), (0, 1)))
+        converted = {
+            (x, y): player
+            for x, y, player, _number in playback.frames_by_path[(0, 1)].stones
+        }
+        self.assertEqual(converted, {(2, 2): "B", (3, 3): "W"})
+        self.assertIn("AE[aa]", text)
+        self.assertIn("AB[cg]", text)
+        self.assertIn("AW[df]", text)
+        self.assertIn("KM[0.5]", text)
+        converted_node = playback.root.ordered_children[0].ordered_children[1]
+        self.assertEqual(converted_node.get_property("PL"), "W")
 
     def test_board_navigation_and_gallery_share_the_existing_media_box(self):
         board = ReadOnlySgfBoard()
@@ -158,8 +198,8 @@ class SgfViewerTests(unittest.TestCase):
         gallery = PositionImageGallery()
         gallery.resize(700, 620)
         gallery.set_images([
-            ("Main image", QPixmap(QSize(20, 20))),
-            ("Solution 1", QPixmap(QSize(20, 20))),
+            ("Primary position", QPixmap(QSize(20, 20))),
+            ("Variation 1", QPixmap(QSize(20, 20))),
         ], self.sgf_path)
         gallery.show()
         self.app.processEvents()

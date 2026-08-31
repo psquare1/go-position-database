@@ -11,6 +11,7 @@ import yaml
 
 from .config import DEFAULT_ROOT, default_config_yaml, load_config
 from .database import GoPositionDatabase
+from .recognition import RecognitionError
 from .storage import (
     DatabaseError,
     clean_position_files,
@@ -31,7 +32,7 @@ from .tags import TagGraph
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="go_db.py",
-        description="Tag, validate, and search a filesystem database of annotated Go positions.",
+        description="Tag, validate, and search a filesystem database of annotated Go study entries.",
     )
     p.add_argument("--root", type=Path, default=None, help=f"Database root (default: GO_POSITION_DB_ROOT or {DEFAULT_ROOT})")
     p.add_argument("--config", type=Path, default=None, help="Optional path to config.yaml")
@@ -48,13 +49,19 @@ def parser() -> argparse.ArgumentParser:
     search.add_argument("--json", action="store_true", help="Emit JSON instead of human-readable text.")
     search.add_argument("--limit", type=int, default=None, help="Maximum results to print.")
 
-    sub.add_parser("check", help="Validate positions, tags, inheritance, and generated index consistency.")
-    sub.add_parser("rebuild-index", help="Regenerate the redundant tag index from canonical position metadata.")
-    clean = sub.add_parser("clean", help="Normalize arbitrary SGF/image filenames inside position folders.")
-    clean.add_argument("position_ids", nargs="*", help="Positions to clean; omit to clean every position.")
+    sub.add_parser("check", help="Validate entries, tags, inheritance, and generated index consistency.")
+    sub.add_parser("rebuild-index", help="Regenerate the redundant tag index from canonical entry metadata.")
+    clean = sub.add_parser("clean", help="Normalize arbitrary SGF/image filenames inside entry folders.")
+    clean.add_argument("position_ids", nargs="*", help="Entries to clean; omit to clean every entry.")
     clean.add_argument("--dry-run", action="store_true", help="Show renames without changing files.")
 
-    pos = sub.add_parser("position", aliases=["pos"], help="Create, inspect, or edit a position.")
+    recognition = sub.add_parser(
+        "recognition", help="Inspect built-in image-to-SGF support."
+    )
+    recognition_sub = recognition.add_subparsers(dest="recognition_command", required=True)
+    recognition_sub.add_parser("status", help="Show whether an external recognizer is available.")
+
+    pos = sub.add_parser("position", aliases=["pos"], help="Create, inspect, or edit an entry.")
     pos_sub = pos.add_subparsers(dest="position_command", required=True)
 
     c = pos_sub.add_parser("create")
@@ -77,7 +84,7 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument("position_id")
     r.add_argument("tags", nargs="+")
 
-    st = pos_sub.add_parser("set-tags", help="Replace the position's explicit tag list.")
+    st = pos_sub.add_parser("set-tags", help="Replace the entry's explicit tag list.")
     st.add_argument("position_id")
     st.add_argument("tags", nargs="*")
 
@@ -111,7 +118,7 @@ def parser() -> argparse.ArgumentParser:
 
     tr = tag_sub.add_parser("remove")
     tr.add_argument("name")
-    tr.add_argument("--force", action="store_true", help="Also remove this tag from child parent lists. Position references are still validated separately.")
+    tr.add_argument("--force", action="store_true", help="Also remove this tag from child parent lists. Entry references are still validated separately.")
 
     tap = tag_sub.add_parser("add-parent")
     tap.add_argument("name")
@@ -188,11 +195,12 @@ def _print_search(db: GoPositionDatabase, ids: list[str], verbose: bool, json_mo
         print(f"  description: {rec['description']}")
         print(f"  score: {rec['score'] or '(none)'}")
         print(f"  tags: {', '.join(rec['tags']) or '(none)'}")
-        print(f"  solution images: {len(rec['solution_images'])}")
+        print(f"  variations: {len(rec['solution_images'])}")
         print(f"  sgf: {sgf or '(none)'}")
         print(f"  image: {image or '(none)'}")
     suffix = "" if len(shown) == len(ids) else f"; showing {len(shown)}"
-    print(f"\n{len(ids)} position(s) found{suffix}.")
+    entry_label = "entry" if len(ids) == 1 else "entries"
+    print(f"\n{len(ids)} {entry_label} found{suffix}.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -207,6 +215,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "gui":
         from .gui import run_gui
         return run_gui(root=root, config_path=args.config)
+
+    if args.command == "recognition":
+        from .recognition import recognition_status
+        if args.recognition_command == "status":
+            available, message = recognition_status()
+            print(message)
+            return 0 if available else 1
 
     config = load_config(root=root, config_path=args.config)
     db = GoPositionDatabase(config)
@@ -228,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "rebuild-index":
         data = db.rebuild_index()
-        print(f"Wrote {config.index_file} ({len(data['position_to_expanded_tags'])} positions).")
+        print(f"Wrote {config.index_file} ({len(data['position_to_expanded_tags'])} entries).")
         return 0
 
     if args.command == "clean":
@@ -243,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  {action}")
                 total_actions += len(actions)
         prefix = "Would perform" if args.dry_run else "Performed"
-        print(f"{prefix} {total_actions} rename(s) across {len(position_ids)} position(s).")
+        print(f"{prefix} {total_actions} rename(s) across {len(position_ids)} entries.")
         return 0
 
     if args.command in {"position", "pos"}:
@@ -253,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
             tags = _canonicalize_tags(graph, args.tag)
             create_position(config, args.position_id, args.sgf, args.image, args.description, tags, _meta_pairs(args.meta))
             db.rebuild_index()
-            print(f"Created position {args.position_id}")
+            print(f"Created entry {args.position_id}")
             return 0
 
         rec = load_position(config, args.position_id)
@@ -335,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
                 if any(graph.normalize(t) == graph.normalize(canonical) for t in rec["tags"]):
                     refs.append(pid)
             if refs:
-                raise DatabaseError(f"Tag '{canonical}' is still explicitly used by positions: {', '.join(refs)}")
+                raise DatabaseError(f"Tag '{canonical}' is still explicitly used by entries: {', '.join(refs)}")
             graph.remove(args.name, args.force)
             db.rebuild_index()
             print(f"Removed tag {canonical}")
@@ -357,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
 def run() -> None:
     try:
         raise SystemExit(main())
-    except DatabaseError as e:
+    except (DatabaseError, RecognitionError) as e:
         print(f"error: {e}", file=sys.stderr)
         raise SystemExit(2)
 

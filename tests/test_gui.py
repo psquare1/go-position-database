@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QPixmap, QTextCursor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QPlainTextEdit
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QPlainTextEdit
 
 from go_position_db.config import Config
 from go_position_db.database import GoPositionDatabase
@@ -26,6 +26,11 @@ from go_position_db.gui import (
     TagManagerPage,
     MainWindow,
     score_chip_stylesheet,
+)
+from go_position_db.recognition import (
+    RecognitionError,
+    RecognitionResult,
+    RecognitionUnavailableError,
 )
 from go_position_db.storage import atomic_dump_yaml, load_position, save_position
 from go_position_db.tags import TagGraph
@@ -49,8 +54,8 @@ class GuiTests(unittest.TestCase):
     def test_gallery_has_no_carousel_controls(self):
         gallery = PositionImageGallery()
         gallery.set_images([
-            ("Main image", QPixmap(QSize(20, 20))),
-            ("Solution 1", QPixmap(QSize(20, 20))),
+            ("Primary position", QPixmap(QSize(20, 20))),
+            ("Variation 1", QPixmap(QSize(20, 20))),
         ])
         self.assertFalse(hasattr(gallery, "previous_button"))
         self.assertFalse(hasattr(gallery, "next_button"))
@@ -94,7 +99,7 @@ class GuiTests(unittest.TestCase):
         ) as confirmation:
             manager.delete_tag()
 
-        self.assertIn("removed from 1 directly tagged position", confirmation.call_args.args[2])
+            self.assertIn("removed from 1 directly tagged entry", confirmation.call_args.args[2])
         self.assertFalse(TagGraph(self.cfg).has("joseki"))
         self.assertEqual(load_position(self.cfg, position_id)["tags"], [])
         self.assertFalse(manager.tag_list.findItems("joseki", Qt.MatchExactly))
@@ -309,6 +314,8 @@ class GuiTests(unittest.TestCase):
             "solution_images": [],
         })
         window = MainWindow(self.cfg.root)
+        self.assertEqual(window.browse_nav_btn.text(), "Browse entries")
+        self.assertEqual(window.new_nav_btn.text(), "New entry")
         self.assertTrue((directory / self.cfg.sgf_filename).exists())
         self.assertFalse((directory / "downloaded-game.sgf").exists())
         self.assertIs(window.editor.save_status_label.parentWidget(), window.statusBar())
@@ -343,15 +350,8 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(editor.solution_images[0]["kind"], "board")
         self.assertEqual(editor.solution_images[0]["sgf_start_path"], [0])
         self.assertIs(editor.image_gallery.media_stack.currentWidget(), board)
-        self.assertEqual(editor.baseline_menu_button.text(), "Set baseline")
-        self.assertEqual(editor.baseline_menu_button.toolTip(), "Selected baseline: board")
-        self.assertEqual(
-            {
-                action.text() for action in editor.sgf_menu_btn.menu().actions()
-                if action.text()
-            },
-            {"Choose SGF from file…", "Create new SGF", "Remove SGF…"},
-        )
+        self.assertEqual(editor.baseline_menu_button.text(), "Set starting view")
+        self.assertEqual(editor.baseline_menu_button.toolTip(), "Selected starting view: board")
         baseline_actions = {
             action.text(): action
             for action in editor.baseline_menu_button.menu().actions()
@@ -360,22 +360,29 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(
             set(baseline_actions),
             {
-                "Image from file…", "Image from clipboard", "Current SGF node",
-                "Display SGF board", "Display image",
-                "Del — remove selected solution…",
+                "Set image", "Set SGF", "Set current SGF node",
+                "Display SGF board", "Display Image", "Del",
             },
         )
-        delete_solution_action = baseline_actions["Del — remove selected solution…"]
+        self.assertEqual(
+            {action.text() for action in baseline_actions["Set image"].menu().actions()},
+            {"From files…", "From clipboard"},
+        )
+        self.assertEqual(
+            {action.text() for action in baseline_actions["Set SGF"].menu().actions()},
+            {"New SGF", "From files…", "From clipboard", "From selected image"},
+        )
+        delete_solution_action = baseline_actions["Del"]
         self.assertTrue(delete_solution_action.isEnabled())
-        self.assertIn("main position is not deleted", delete_solution_action.toolTip())
+        self.assertIn("primary position is not deleted", delete_solution_action.toolTip())
         self.assertIn("background: #f6c7cf", delete_solution_action.defaultWidget().styleSheet())
         self.assertGreaterEqual(
             sum(action.isSeparator() for action in editor.baseline_menu_button.menu().actions()),
             3,
         )
         self.assertTrue(baseline_actions["Display SGF board"].isChecked())
-        self.assertFalse(baseline_actions["Display image"].isEnabled())
-        baseline_actions["Current SGF node"].trigger()
+        self.assertFalse(baseline_actions["Display Image"].isEnabled())
+        baseline_actions["Set current SGF node"].trigger()
         self.assertEqual(editor.solution_images[0]["sgf_start_path"], [0])
 
         solution_image = QPixmap(QSize(20, 20))
@@ -389,8 +396,8 @@ class GuiTests(unittest.TestCase):
             for action in editor.baseline_menu_button.menu().actions()
             if action.text()
         }
-        self.assertTrue(baseline_actions["Display image"].isEnabled())
-        baseline_actions["Display image"].trigger()
+        self.assertTrue(baseline_actions["Display Image"].isEnabled())
+        baseline_actions["Display Image"].trigger()
         self.assertEqual(editor.solution_images[0]["kind"], "image")
         self.assertIs(
             editor.image_gallery.media_stack.currentWidget(),
@@ -404,8 +411,8 @@ class GuiTests(unittest.TestCase):
         baseline_actions["Display SGF board"].trigger()
         self.assertEqual(editor.solution_images[0]["kind"], "board")
         self.assertEqual(len(editor.solution_tab_buttons), 2)
-        self.assertEqual(editor.solution_tab_buttons[0].text(), "Main")
-        self.assertEqual(editor.solution_tab_buttons[1].text(), "S1")
+        self.assertEqual(editor.solution_tab_buttons[0].text(), "Primary")
+        self.assertEqual(editor.solution_tab_buttons[1].text(), "V1")
         editor.resize(1500, 900)
         editor.show()
         self.app.processEvents()
@@ -426,10 +433,9 @@ class GuiTests(unittest.TestCase):
         self.assertLess(initial_baseline_left, editor.solution_strip_slot.geometry().left())
         self.assertEqual(editor.solution_strip.height(), 40)
         self.assertTrue(all(button.height() == 34 for button in editor.solution_tab_buttons))
-        self.assertEqual(editor.sgf_menu_btn.size(), editor.open_folder_btn.size())
         self.assertEqual(editor.open_folder_btn.size(), editor.delete_btn.size())
-        self.assertEqual(editor.back_btn.height(), editor.sgf_menu_btn.height())
-        self.assertEqual(editor.baseline_menu_button.height(), editor.sgf_menu_btn.height())
+        self.assertEqual(editor.back_btn.height(), editor.open_folder_btn.height())
+        self.assertEqual(editor.baseline_menu_button.height(), editor.open_folder_btn.height())
         editor.refresh_gallery(0)
         self.app.processEvents()
         self.assertEqual(editor.solution_controls.geometry(), solution_controls_geometry)
@@ -438,7 +444,7 @@ class GuiTests(unittest.TestCase):
             for action in editor.baseline_menu_button.menu().actions()
             if action.text()
         }
-        self.assertFalse(main_actions["Del — remove selected solution…"].isEnabled())
+        self.assertFalse(main_actions["Del"].isEnabled())
         editor.refresh_gallery(1)
         self.app.processEvents()
         self.assertEqual(editor.solution_controls.geometry(), solution_controls_geometry)
@@ -463,13 +469,13 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(saved["solution_images"][0]["kind"], "board")
         self.assertEqual(saved["solution_images"][0]["sgf_start_path"], [0])
 
-        # Main plus five solutions fit before the overflow menu is needed.
+        # The primary position plus five variations fit before overflow is needed.
         for _ in range(4):
             editor.add_solution_board()
         self.app.processEvents()
         self.assertEqual(
             [button.text() for button in editor.solution_tab_buttons],
-            ["Main", "S1", "S2", "S3", "S4", "S5"],
+            ["Primary", "V1", "V2", "V3", "V4", "V5"],
         )
         self.assertEqual(editor.solution_strip.geometry().left(), initial_strip_left)
         self.assertGreater(editor.solution_strip.width(), initial_strip_width)
@@ -495,35 +501,232 @@ class GuiTests(unittest.TestCase):
             for action in editor.baseline_menu_button.menu().actions()
             if action.text()
         }
-        self.assertIn("Create new SGF", baseline_actions)
-        self.assertNotIn("Current SGF node", baseline_actions)
-        self.assertEqual(
-            {
-                action.text() for action in editor.sgf_menu_btn.menu().actions()
-                if action.text()
-            },
-            {"Choose SGF from file…", "Create new SGF"},
+        self.assertIn("Set SGF", baseline_actions)
+        self.assertNotIn("Set current SGF node", baseline_actions)
+        self.assertIn(
+            "New SGF",
+            {action.text() for action in baseline_actions["Set SGF"].menu().actions()},
         )
 
-        baseline_actions["Create new SGF"].trigger()
+        baseline_actions["Set SGF"].menu().actions()[0].trigger()
         self.assertIsNotNone(editor.pending_sgf_text)
         self.assertIsNotNone(editor.image_gallery.sgf_board.current_frame)
         self.assertIn(
-            "Current SGF node",
+            "Set current SGF node",
             {
                 action.text() for action in editor.baseline_menu_button.menu().actions()
                 if action.text()
             },
         )
-        self.assertIn(
-            "Remove SGF…",
-            {
-                action.text() for action in editor.sgf_menu_btn.menu().actions()
-                if action.text()
-            },
-        )
         self.assertTrue(editor.save_current())
         self.assertTrue((directory / self.cfg.sgf_filename).exists())
+        editor.close()
+
+    def test_convert_action_is_conditional_and_creates_setup_sgf(self):
+        position_id = "p000003"
+        directory = self.cfg.positions_dir / position_id
+        directory.mkdir()
+        image_path = directory / self.cfg.image_filename
+        image = QPixmap(QSize(120, 120))
+        image.fill(QColor("#d9b46c"))
+        self.assertTrue(image.save(str(image_path)))
+        original_bytes = image_path.read_bytes()
+        save_position(self.cfg, position_id, {
+            "description": "",
+            "score": "",
+            "main_media_kind": "board",
+            "tags": [],
+            "metadata": {},
+            "solution_images": [],
+        })
+        editor = PositionEditor(self.cfg)
+        self.assertTrue(editor.load_position(position_id))
+        actions = {action.text() for action in editor.baseline_menu_button.menu().actions()}
+        self.assertNotIn("Convert to SGF…", actions)
+
+        editor._set_selected_media_kind("image")
+        actions = {
+            action.text(): action for action in editor.baseline_menu_button.menu().actions()
+            if action.text()
+        }
+        self.assertIn("From selected image", {
+            action.text() for action in actions["Set SGF"].menu().actions()
+        })
+        self.assertGreaterEqual(
+            sum(
+                action.isSeparator()
+                for action in editor.baseline_menu_button.menu().actions()
+            ),
+            3,
+        )
+        with patch("go_position_db.gui.LizGobanRecognitionDialog") as review_dialog:
+            review_dialog.return_value.exec.return_value = QDialog.Accepted
+            review_dialog.return_value.result = RecognitionResult(
+                19, frozenset({(0, 0), (3, 3)}), frozenset({(18, 18)}),
+                player_to_move="W", komi=7.5,
+            )
+            actions["Set SGF"].menu().actions()[-1].trigger()
+        review_dialog.assert_called_once()
+        self.assertEqual(editor.main_media_kind, "board")
+        self.assertEqual(editor.main_sgf_start_path, [])
+        self.assertIn("AB[as][dp]", editor.pending_sgf_text)
+        self.assertIn("AW[sa]", editor.pending_sgf_text)
+        self.assertIn("PL[W]", editor.pending_sgf_text)
+        self.assertIn("KM[7.5]", editor.pending_sgf_text)
+        self.assertEqual(image_path.read_bytes(), original_bytes)
+        self.assertTrue(editor.save_current())
+        self.assertEqual(image_path.read_bytes(), original_bytes)
+        self.assertTrue((directory / self.cfg.sgf_filename).exists())
+        editor.close()
+
+    def test_set_baseline_creates_from_clipboard_without_intermediate_steps(self):
+        position_id = "p000003-direct"
+        directory = self.cfg.positions_dir / position_id
+        directory.mkdir()
+        save_position(self.cfg, position_id, {
+            "description": "", "score": "", "tags": [], "metadata": {},
+            "solution_images": [],
+        })
+        clipboard_image = QPixmap(QSize(90, 90))
+        clipboard_image.fill(QColor("#d9b46c"))
+        QApplication.clipboard().setPixmap(clipboard_image)
+        editor = PositionEditor(self.cfg)
+        try:
+            self.assertTrue(editor.load_position(position_id))
+            create_from_image = {
+                action.text(): action for action in editor.baseline_menu_button.menu().actions()
+                if action.text()
+            }["Set SGF"]
+            source_actions = {
+                action.text(): action for action in create_from_image.menu().actions()
+                if action.text()
+            }
+            self.assertEqual(
+                set(source_actions),
+                {"New SGF", "From files…", "From clipboard", "From selected image"},
+            )
+            self.assertTrue(source_actions["From clipboard"].isEnabled())
+            self.assertFalse(source_actions["From selected image"].isEnabled())
+            with patch("go_position_db.gui.LizGobanRecognitionDialog") as review_dialog:
+                review_dialog.return_value.exec.return_value = QDialog.Accepted
+                review_dialog.return_value.result = RecognitionResult(
+                    19, frozenset({(4, 4)}), frozenset({(5, 5)})
+                )
+                source_actions["From clipboard"].trigger()
+            review_dialog.assert_called_once()
+            self.assertIsNotNone(editor.pending_image)
+            self.assertEqual(editor.main_media_kind, "board")
+            self.assertIn("AB[eo]", editor.pending_sgf_text)
+            self.assertIn("AW[fn]", editor.pending_sgf_text)
+            self.assertTrue(editor.save_current())
+            self.assertTrue((directory / self.cfg.image_filename).exists())
+            self.assertTrue((directory / self.cfg.sgf_filename).exists())
+        finally:
+            editor.close()
+            QApplication.clipboard().clear()
+
+    def test_solution_conversion_adds_branch_and_reassigns_only_selected_baseline(self):
+        class Recognizer:
+            def recognize(self, _path, *, board_size):
+                return RecognitionResult(
+                    board_size, frozenset({(2, 2)}), frozenset({(3, 3)})
+                )
+
+        position_id = "p000004"
+        directory = self.cfg.positions_dir / position_id
+        solution_dir = directory / "solutions"
+        solution_dir.mkdir(parents=True)
+        sgf_path = directory / self.cfg.sgf_filename
+        original_sgf = "(;GM[1]FF[4]SZ[19]C[root];B[aa](;W[bb]C[existing]))"
+        sgf_path.write_text(original_sgf, encoding="utf-8")
+        solution_path = solution_dir / "solution-001.png"
+        image = QPixmap(QSize(100, 100))
+        image.fill(QColor("#d9b46c"))
+        self.assertTrue(image.save(str(solution_path)))
+        original_image = solution_path.read_bytes()
+        save_position(self.cfg, position_id, {
+            "description": "",
+            "score": "",
+            "main_media_kind": "board",
+            "sgf_start_path": [],
+            "tags": [],
+            "metadata": {},
+            "solution_images": [{
+                "kind": "image", "file": "solutions/solution-001.png",
+                "description": "", "score": "", "sgf_start_path": [0],
+            }],
+        })
+        editor = PositionEditor(self.cfg, recognition_service=Recognizer())
+        self.assertTrue(editor.load_position(position_id))
+        editor.refresh_gallery(1)
+        with patch("go_position_db.gui.QMessageBox.question", return_value=QMessageBox.Yes):
+            editor.convert_selected_image_to_sgf()
+        self.assertEqual(editor.solution_images[0]["kind"], "board")
+        self.assertEqual(editor.solution_images[0]["sgf_start_path"], [0, 1])
+        self.assertEqual(editor.main_sgf_start_path, [])
+        self.assertIn("C[existing]", editor.pending_sgf_text)
+        self.assertEqual(solution_path.read_bytes(), original_image)
+        self.assertTrue(editor.save_current())
+        self.assertIn("C[existing]", sgf_path.read_text(encoding="utf-8"))
+        self.assertEqual(solution_path.read_bytes(), original_image)
+        editor.close()
+
+    def test_recognition_failure_and_malformed_result_do_not_change_editor(self):
+        class Failure:
+            def recognize(self, _path, *, board_size):
+                raise RecognitionError("grid not found")
+
+        class Malformed:
+            def recognize(self, _path, *, board_size):
+                return {"black": [[0, 0]]}
+
+        position_id = "p000005"
+        directory = self.cfg.positions_dir / position_id
+        directory.mkdir()
+        image_path = directory / self.cfg.image_filename
+        image = QPixmap(QSize(80, 80))
+        image.fill(QColor("#d9b46c"))
+        self.assertTrue(image.save(str(image_path)))
+        original_image = image_path.read_bytes()
+        save_position(self.cfg, position_id, {
+            "description": "", "score": "", "main_media_kind": "image",
+            "tags": [], "metadata": {}, "solution_images": [],
+        })
+        for service in (Failure(), Malformed()):
+            editor = PositionEditor(self.cfg, recognition_service=service)
+            self.assertTrue(editor.load_position(position_id))
+            with patch("go_position_db.gui.QMessageBox.critical") as critical:
+                editor.convert_selected_image_to_sgf()
+            critical.assert_called_once()
+            self.assertIsNone(editor.pending_sgf_text)
+            self.assertEqual(editor.main_media_kind, "image")
+            self.assertEqual(image_path.read_bytes(), original_image)
+            editor.close()
+
+    def test_missing_recognizer_is_explained_without_changing_editor(self):
+        class Unavailable:
+            def recognize(self, _path, *, board_size):
+                raise RecognitionUnavailableError("Recognition support is missing.")
+
+        position_id = "p000006"
+        directory = self.cfg.positions_dir / position_id
+        directory.mkdir()
+        image_path = directory / self.cfg.image_filename
+        image = QPixmap(QSize(80, 80))
+        image.fill(QColor("#d9b46c"))
+        self.assertTrue(image.save(str(image_path)))
+        save_position(self.cfg, position_id, {
+            "description": "", "score": "", "main_media_kind": "image",
+            "tags": [], "metadata": {}, "solution_images": [],
+        })
+        editor = PositionEditor(self.cfg, recognition_service=Unavailable())
+        self.assertTrue(editor.load_position(position_id))
+        with patch("go_position_db.gui.QMessageBox.information") as information:
+            editor.convert_selected_image_to_sgf()
+        information.assert_called_once()
+        self.assertIsNone(editor.pending_sgf_text)
+        self.assertEqual(editor.main_media_kind, "image")
+        self.assertTrue(image_path.exists())
         editor.close()
 
 
