@@ -179,7 +179,7 @@ class KataGoTests(unittest.TestCase):
         self.assertEqual(
             query["reportDuringSearchEvery"], ANALYSIS_REPORT_INTERVAL_SECONDS
         )
-        self.assertEqual(query["rootPolicyTemperature"], 1.0)
+        self.assertEqual(query["rootPolicyTemperature"], 1.1)
 
     def test_fixture_response_exposes_root_candidates_and_ownership(self):
         response = {

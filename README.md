@@ -1,25 +1,18 @@
 # Go Position DB
 
-Go Position Database is a desktop library for organizing Go study entries using
-hierarchical tags, efficiently searching for entries based on tags, and
-analyzing their primary positions and variations in detail.
+Go Position Database is a PySide6 desktop application for storing, editing, and
+searching Go study positions. Entries may contain images, SGFs, variations,
+descriptions, scores, metadata, and hierarchical tags.
 
-The PySide6 desktop app is the primary interface. It includes a visual browser,
-an entry editor with SGF tools, and a tag manager.
+## Features
 
-## What you can do
-
-- Build a personal collection of entries from existing SGFs or screenshots of
-  Go positions.
-- Add image-based or SGF-based variations of each entry's primary position,
-  each with its own annotations and commentary.
-- Describe primary positions and variations with free-form notes, scores,
-  structured metadata, and any number of tags.
-- Organize tags into parent/child hierarchies. An entry tagged
-  `3-3-joseki`, for example, also appears in a search for `joseki`.
-- Search with Boolean expressions such as `joseki AND NOT ko`.
-- Keep the collection in ordinary folders that can be inspected, synchronized,
-  or versioned with Git independently of the app.
+- Image- and SGF-based primary positions and variations.
+- Native SGF board editing and variation navigation.
+- Free-form descriptions, scores, structured metadata, and hierarchical tags.
+- Boolean tag searches such as `joseki AND NOT ko`, including inherited tags.
+- Optional analysis through a locally installed KataGo engine.
+- Folder-based collection storage that can be inspected or versioned separately
+  from the application.
 
 ## Quick start on Windows
 
@@ -35,7 +28,7 @@ option that adds Python to `PATH`.
 
 2. Double-click `launch_gui.bat`.
 
-The launcher creates a private Python environment, installs the required
+The launcher creates a project-local Python environment, installs the required
 packages, initializes an empty collection on first launch, and opens the app.
 Later launches reuse the same environment and collection.
 
@@ -59,17 +52,16 @@ On macOS or Linux:
 source .venv/bin/activate
 ```
 
-Then install, initialize, and launch:
+Then install and launch:
 
 ```powershell
 python -m pip install -r requirements-gui.txt
-python go_db.py --root . init
-python go_db.py --root . gui
+python go_db_gui.py
 ```
 
-`--root` selects the folder containing the collection. Omit it to use the
-repository folder, or point it to a separate folder to keep personal data apart
-from the application code.
+The application uses the repository folder as its collection by default. A
+different collection folder can be selected with the `root` setting in
+`config.yaml`.
 
 ## Core workflow
 
@@ -79,11 +71,9 @@ The app is organized around **Browse entries**, **New entry**, and
 ### Create and edit entries
 
 Each entry contains one primary position and any number of variations. A primary
-position can start from an SGF, an image, or both. The app can also create an SGF
-from an existing image using its built-in LizGoban-based converter.
+position can use an SGF, an image, or both.
 
-- SGFs can be loaded from a file, created as a blank 19×19 game, or created from
-  the current image.
+- SGFs can be loaded from a file or created as a blank 19×19 game.
 - Images can be chosen from a file or pasted from the clipboard.
 - When both forms exist, either the image or the native SGF board can be used as
   the starting view.
@@ -95,20 +85,66 @@ Each entry can have any number of variations. Each variation is associated with
 its own image or a node in the entry's shared SGF tree.
 
 The primary position and every variation can have its own description and score.
-KataGo analysis of an item's configured starting node may refresh that score once
-it reaches 100 visits. The accompanying `score_visits` value ensures that a saved
-estimate is replaced only by a more deeply searched estimate; choosing a new
-starting node clears both values.
 
 ### Work with SGFs
 
 The native board can navigate and edit the SGF game tree. It supports ordinary
 moves and passes, adding and erasing setup stones, branches, and number, letter,
 triangle, circle, square, and cross annotations. The primary position and each
-variation can use any node in the SGF as its starting view. This is useful when
-the full game provides context but only a later board position is relevant.
+variation can use any node in the SGF as its starting view.
 
-### Built-in image-to-SGF conversion
+An SGF describes an entire game tree, so the file alone does not identify which
+node is the position relevant to an entry or variation. Navigate the native board
+to that position, then choose **Set starting view → Set current SGF node**. The
+selected node is stored with that primary position or variation and is displayed
+first when it is opened again; the rest of the SGF remains available for context
+and navigation.
+
+### Keyboard shortcuts
+
+Shortcuts apply in the entry editor. Standard editing behavior takes precedence
+while a text, metadata, or tag field has focus.
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+V` | Paste a clipboard image or SGF; confirm before replacing an existing one |
+| `Ctrl+C` | Copy the currently displayed image or SGF |
+| `Ctrl+Left` / `Ctrl+Right` | Select the previous or next primary/variation view |
+| `Alt+D` | Switch between the selected image and SGF view |
+| `Ctrl+R` | Return the board to the saved starting node |
+| `Ctrl+S` | Set the current SGF node as the selected starting view |
+| `Space` | Toggle KataGo analysis |
+| `Backspace` / `Delete` | Delete the current SGF node after confirmation |
+| `Shift+A` | Select alternating-move editing |
+| `Shift+B` / `Shift+W` | Select black or white setup stones |
+| `Shift+E` | Select the eraser |
+| `Shift+P` | Play a pass |
+| `Ctrl+Shift+1` | Select numbered annotations |
+| `Ctrl+Shift+A` | Select letter annotations |
+| `Ctrl+Shift+T` | Select triangle annotations |
+| `Ctrl+Shift+C` | Select circle annotations |
+| `Ctrl+Shift+S` | Select square annotations |
+| `Ctrl+Shift+X` | Select cross annotations |
+
+### AI analysis with KataGo
+
+The application supports analysis through a local KataGo installation. KataGo,
+its neural-network model, and its analysis configuration are not bundled or
+downloaded by the application. Their paths are configured and validated on the
+**KataGo settings** page.
+
+The **AI** control below the native board toggles analysis for the displayed SGF
+position. It remains enabled while navigating within the same SGF and is disabled
+when leaving the entry. Suggested moves are drawn on the board, while score, win
+rate, and visit count are shown in the right panel. Analysis of a primary starting
+position also updates its stored score automatically.
+
+Configurable options include startup and response timeouts, reporting frequency,
+the number and point-loss range of board suggestions, root policy temperature,
+analysis and search thread counts, and neural-network cache size. KataGo runs as
+a managed background process and is stopped when the application closes.
+
+### Image-to-SGF conversion
 
 Image recognition is included with the desktop application. The conversion
 dialog is adapted from
@@ -118,15 +154,10 @@ WebEngine. The converter is primarily intended for clean screenshots. Photograph
 perspective distortion, partial boards, unusual themes, glare, and overlays may
 require additional manual calibration.
 
-The dialog guides you through identifying the board grid, shows all detected
-stones, and lets you correct misidentified intersections.
-
-Use **Set starting view → Set image** to choose an image from a file or the
-clipboard for the selected primary position or variation.
-
-Use **Set starting view → Set SGF** to choose the SGF shared by the entry. You can
-load an SGF file, create a blank SGF, or convert the selected image or clipboard
-image to an SGF.
+The dialog identifies the board grid, displays the detected stones, and allows
+corrections before producing the SGF. For the selected primary position or
+variation, use **Set starting view → Set SGF → From selected image** to convert
+its current image, or **From clipboard** to convert an image from the clipboard.
 
 ### Organize with tags
 
@@ -179,185 +210,19 @@ The on-disk names `positions`, `position.*`, `solutions`, and `solution_images`
 are retained for compatibility with existing collections. In the app and this
 guide they correspond to entries, primary positions, and variations.
 
-Application settings live in `config.yaml` beside the application code. The
-selected collection root remains controlled by `--root`; collection paths below
-are resolved from that root:
-
-```yaml
-positions_directory: positions
-tags_file: tags.yaml
-generated_index: generated/tag_index.yaml
-
-files:
-  sgf: position.sgf
-  image: position.png
-  metadata: metadata.yaml
-
-katago:
-  executable: C:/tools/katago/katago.exe
-  model: C:/tools/katago/model.bin.gz
-  analysis_config: C:/tools/katago/analysis.cfg
-  timeout_seconds: 60
-  startup_timeout_seconds: 180
-  report_interval_seconds: 0.1
-  overlay_top_moves: 5
-  overlay_max_point_loss: 2.0
-  root_policy_temperature: 1.0
-  num_analysis_threads: 1
-  num_search_threads: 16
-  nn_cache_size_power_of_two: 20
-```
-
-The KataGo section is optional. On macOS and Linux, use the corresponding local
-executable path. KataGo paths are resolved relative to the application config;
-environment variables and `~` are expanded. The application does not bundle or
-download KataGo, a neural-network model, or an analysis configuration. Startup
-and analysis have separate timeouts because loading and compiling a large model
-can take substantially longer than analyzing a position once the engine is ready.
-The settings can also be validated and edited from **KataGo settings** in the
-application. The analysis timeout is a stalled-response watchdog, not a visit or
-search-duration limit.
-
-When configured, the **AI** toggle in the native board controls sends the SGF node
-currently visible on the board to a managed background analysis process. KataGo
-is started in the background when the application opens so its executable and
-model are already warm before the first analysis request. It then keeps searching
-and reports progressively stronger snapshots at the configured
-interval, which defaults to 0.1 seconds (10 requested reports per second).
-Navigating within the SGF replaces the obsolete request and continues analysis;
-turning AI off or leaving the entry stops it. The board shows the configured top
-moves, moves below the configured point-loss threshold, and immediate SGF
-continuations. Every displayed move must have at least 10 visits and at least 1%
-as many visits as the leading candidate. Root policy temperature controls how
-broadly KataGo distributes its search; 1.0 is neutral and higher values explore
-more alternatives. Results and ownership data are transient: they are not
-written to the entry record or SGF.
-
-The thread and NN-cache settings are passed to KataGo as launch overrides, so the
-shared external `analysis.cfg` does not need to be rewritten. The defaults favor
-one interactive position and substantially less memory than KataGo's large batch
-analysis example configuration.
+Application settings are stored in `config.yaml` beside the application code.
+They include collection directory and filename settings as well as KataGo
+configuration, including the selected collection root.
 
 The repository ignores its default collection files, so a fresh clone starts
-empty. To version a personal collection, the safest arrangement is a separate
-folder and Git repository launched with:
-
-```powershell
-python go_db.py --root <database-folder> gui
-```
-
-This keeps application updates and private collection history independent.
-
-## Command-line tools
-
-The desktop app is recommended for everyday use, while the CLI supports
-scripting, inspection, validation, and bulk maintenance. Global options appear
-before the command:
-
-```text
---root PATH       use a particular database folder
---config PATH     use a particular config.yaml
-```
-
-### Initialize and launch
-
-```powershell
-python go_db.py --root . init
-python go_db.py --root . init --force
-python go_db.py --root . gui
-```
-
-`init` creates the collection folders and starter tag file. It does not put
-machine-specific application configuration in the collection. `init --force`
-overwrites the starter tag file, but does not erase entry folders.
-
-### Search and inspect
-
-```powershell
-python go_db.py --root . search "joseki AND NOT ko"
-python go_db.py --root . search "joseki" --verbose
-python go_db.py --root . search "joseki" --json
-python go_db.py --root . search "joseki" --limit 20
-
-python go_db.py --root . position show p000001
-python go_db.py --root . position show p000001 --json
-```
-
-Verbose and structured output include descriptions, scores, metadata, variation
-records, and media paths where applicable.
-
-### Validate and maintain the collection
-
-```powershell
-python go_db.py --root . check
-python go_db.py --root . rebuild-index
-python go_db.py --root . clean --dry-run
-python go_db.py --root . clean
-python go_db.py --root . clean p000001 p000002
-```
-
-`check` reports inconsistencies in entry records, media, tags, hierarchy links,
-or the generated index. `rebuild-index` regenerates the search index from the
-canonical records. `clean` normalizes unambiguous image and SGF filenames; use
-`--dry-run` to preview the changes.
-
-### Create and edit entries
-
-```powershell
-python go_db.py --root . position create p000001 --sgf C:\path\position.sgf
-python go_db.py --root . position create p000002 --image C:\path\board.png
-python go_db.py --root . position create p000003 --image C:\path\board.png --sgf C:\path\game.sgf --description "Corner variation" --tag joseki --meta "move=38"
-
-python go_db.py --root . position add-tag p000001 joseki reverse-sente
-python go_db.py --root . position remove-tag p000001 reverse-sente
-python go_db.py --root . position set-tags p000001 joseki tesuji
-python go_db.py --root . position set-description p000001 "Black should connect first."
-```
-
-Creation requires an image, an SGF, or both. `--tag` and `--meta KEY=VALUE` can
-be repeated. The legacy CLI command name `position` is retained for
-compatibility and can be shortened to `pos`; it operates on entries.
-
-Metadata supports nested keys and values parsed as JSON when possible, so
-numbers, booleans, arrays, and objects retain their types:
-
-```powershell
-python go_db.py --root . position meta-set p000001 source "study notes"
-python go_db.py --root . position meta-set p000001 source.page 127
-python go_db.py --root . position meta-show p000001
-python go_db.py --root . position meta-show p000001 source.page
-python go_db.py --root . position meta-delete p000001 source.page
-```
-
-The CLI reads and preserves scores and variation records, but those fields are
-currently edited through the desktop app.
-
-### Manage tags
-
-```powershell
-python go_db.py --root . tag list
-python go_db.py --root . tag list --tree
-python go_db.py --root . tag add joseki --description "Established corner sequences"
-python go_db.py --root . tag add 3-3-joseki --parent joseki
-python go_db.py --root . tag add invasion-joseki --parent joseki --parent invasion
-python go_db.py --root . tag add-parent 3-3-joseki invasion
-python go_db.py --root . tag remove-parent 3-3-joseki invasion
-python go_db.py --root . tag remove unused-tag
-python go_db.py --root . tag remove unused-parent --force
-```
-
-`tag` can also be written as `tags`. Removing a tag is blocked while entries
-refer to it directly. `--force` permits removal from child parent-lists; it does
-not discard entry references.
-
-Run `python go_db.py --help`, or add `--help` after a command or subcommand, for
-the complete accepted syntax.
+empty. Keeping a collection in a separate folder allows application updates and
+private collection history to remain independent.
 
 ## License
 
-Except where an included component states otherwise, Go Position Database is
-free software licensed under the GNU General Public License, version 3 or (at
-your option) any later version (`GPL-3.0-or-later`). See the [license](LICENSE).
+Go Position Database is free software licensed under the GNU General Public
+License, version 3 or (at your option) any later version
+(`GPL-3.0-or-later`). See the [license](LICENSE).
 
 The bundled image-to-SGF converter is adapted from
 [LizGoban](https://github.com/kaorahi/lizgoban) at the pinned revision documented
@@ -376,6 +241,6 @@ Possible future directions include:
 
 - a preset vocabulary of common Go tags;
 - publishing, sharing, or merging collections; and
-- KataGo candidate-move and ownership overlays on the native board.
+- additional KataGo analysis visualizations.
 
 Pull requests are welcome.

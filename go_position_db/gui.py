@@ -120,6 +120,7 @@ from .sgf_viewer import (
     BoardMoveOverlay,
     ReadOnlySgfBoard,
     insert_setup_position,
+    load_sgf_text,
     media_card_rects,
     render_sgf_board,
 )
@@ -128,6 +129,9 @@ from .tags import TagGraph, normalize_tag_name, validate_new_tag_name
 IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)"
 SGF_FILTER = "SGF Files (*.sgf);;All Files (*)"
 NEW_SGF_TEXT = "(;GM[1]FF[4]CA[UTF-8]AP[Go Position DB]SZ[19])"
+SCORE_AUTOSAVE_MIN_VISITS = 1_000
+OVERLAY_MIN_MOVE_VISITS = 200
+OVERLAY_MIN_LEADER_FRACTION = 0.01
 
 
 @dataclass
@@ -1455,9 +1459,6 @@ class PositionEditor(QWidget):
             analysis_layout.addWidget(caption_label, 0, column)
             analysis_layout.addWidget(value_label, 1, column)
             analysis_layout.setColumnStretch(column, 1)
-        self.analysis_status_label = QLabel("AI is off")
-        self.analysis_status_label.setStyleSheet("color: #766970; font-size: 10px;")
-        analysis_layout.addWidget(self.analysis_status_label, 2, 0, 1, 3)
         details_layout.addWidget(self.analysis_box)
 
         self.description_edit = QTextEdit()
@@ -1516,6 +1517,36 @@ class PositionEditor(QWidget):
         self.next_solution_shortcut.activated.connect(
             lambda: self.navigate_solution(1)
         )
+        self.editor_shortcuts = [
+            self.previous_solution_shortcut,
+            self.next_solution_shortcut,
+        ]
+        shortcut_actions = (
+            ("Ctrl+V", self.paste_clipboard_media),
+            ("Shift+A", lambda: self._click_board_tool("play")),
+            ("Shift+B", lambda: self._click_board_tool("black_setup")),
+            ("Shift+W", lambda: self._click_board_tool("white_setup")),
+            ("Shift+E", lambda: self._click_board_tool("erase")),
+            ("Shift+P", self._play_pass),
+            ("Space", self._toggle_ai_analysis),
+            ("Backspace", self._delete_current_sgf_node),
+            ("Delete", self._delete_current_sgf_node),
+            ("Ctrl+Shift+1", lambda: self._click_annotation_tool("numbers")),
+            ("Ctrl+Shift+A", lambda: self._click_annotation_tool("letters")),
+            ("Ctrl+Shift+T", lambda: self._click_annotation_tool("triangles")),
+            ("Ctrl+Shift+C", lambda: self._click_annotation_tool("circles")),
+            ("Ctrl+Shift+S", lambda: self._click_annotation_tool("squares")),
+            ("Ctrl+Shift+X", lambda: self._click_annotation_tool("crosses")),
+            ("Ctrl+C", self.copy_displayed_media),
+            ("Ctrl+R", self._refresh_starting_view),
+            ("Ctrl+S", self._save_current_node_as_start),
+            ("Alt+D", self.toggle_displayed_media),
+        )
+        for sequence, action in shortcut_actions:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(action)
+            self.editor_shortcuts.append(shortcut)
         app = QApplication.instance()
         if app is not None:
             app.focusChanged.connect(self._update_solution_shortcuts)
@@ -1535,26 +1566,18 @@ class PositionEditor(QWidget):
 
     def _warm_start_katago(self) -> None:
         self._clear_analysis_values()
-        self.analysis_status_label.setStyleSheet("color: #52636e; font-size: 10px;")
-        self.analysis_status_label.setText("Preparing AI engine…")
         try:
             self.katago_client.start()
         except KataGoError as error:
             self._on_katago_startup_failed(str(error))
 
-    def _on_katago_ready(self, version: str) -> None:
-        if self._ai_analysis_enabled:
-            return
-        self._clear_analysis_values()
-        self.analysis_status_label.setStyleSheet("color: #52636e; font-size: 10px;")
-        self.analysis_status_label.setText(f"AI ready · KataGo {version}")
+    def _on_katago_ready(self, _version: str) -> None:
+        if not self._ai_analysis_enabled:
+            self._clear_analysis_values()
 
-    def _on_katago_startup_failed(self, message: str) -> None:
-        if self._ai_analysis_enabled:
-            return
-        self._clear_analysis_values()
-        self.analysis_status_label.setStyleSheet("color: #8a3347; font-size: 10px;")
-        self.analysis_status_label.setText(message)
+    def _on_katago_startup_failed(self, _message: str) -> None:
+        if not self._ai_analysis_enabled:
+            self._clear_analysis_values()
 
     def _set_analysis_busy(self, busy: bool) -> None:
         if not busy and not self._ai_analysis_enabled:
@@ -1611,9 +1634,6 @@ class PositionEditor(QWidget):
         if self._current_analysis_key() is None:
             board.set_ai_enabled(False)
             self._clear_analysis_values()
-            self.analysis_status_label.setText(
-                "Display an SGF board position before enabling AI"
-            )
             return
         self._ai_analysis_enabled = True
         board.set_ai_enabled(True)
@@ -1651,10 +1671,6 @@ class PositionEditor(QWidget):
             return
         self._analysis_position_key = self._current_analysis_key()
         self._clear_analysis_values()
-        self.analysis_status_label.setStyleSheet("color: #52636e; font-size: 10px;")
-        self.analysis_status_label.setText(
-            f"Starting continuous analysis of node {frame.move_number}…"
-        )
 
     def _show_analysis(self, result: KataGoAnalysis) -> None:
         if self._analysis_position_key != self._current_analysis_key():
@@ -1666,7 +1682,6 @@ class PositionEditor(QWidget):
             self._display_winrate(result.winrate)
         )
         self.analysis_visits_value.setText(f"{result.visits:,}")
-        self.analysis_status_label.hide()
         self._store_analysis_score(result)
         self._show_move_overlays(result)
 
@@ -1695,7 +1710,7 @@ class PositionEditor(QWidget):
         frame = board.current_frame
         if (
             result.score_lead is None
-            or result.visits < 100
+            or result.visits < SCORE_AUTOSAVE_MIN_VISITS
             or frame is None
             or tuple(frame.node_path) != tuple(self._selected_sgf_start_path())
         ):
@@ -1741,8 +1756,8 @@ class PositionEditor(QWidget):
         leading_visits = result.candidates[0].visits if result.candidates else 0
         for candidate in result.candidates:
             if (
-                candidate.visits < 10
-                or candidate.visits < leading_visits * 0.01
+                candidate.visits < OVERLAY_MIN_MOVE_VISITS
+                or candidate.visits < leading_visits * OVERLAY_MIN_LEADER_FRACTION
             ):
                 continue
             try:
@@ -1766,8 +1781,10 @@ class PositionEditor(QWidget):
         board.set_move_overlays(list(overlays.values()))
 
     def _show_analysis_error(self, message: str) -> None:
-        self.disable_ai_analysis(message)
-        self.analysis_status_label.setStyleSheet("color: #8a3347; font-size: 10px;")
+        was_enabled = self._ai_analysis_enabled
+        self.disable_ai_analysis()
+        if was_enabled:
+            QMessageBox.warning(self, "KataGo Analysis", message)
 
     def _on_board_position_changed(self) -> None:
         self.katago_client.cancel()
@@ -1775,14 +1792,13 @@ class PositionEditor(QWidget):
         self.image_gallery.sgf_board.set_move_overlays(())
         self._clear_analysis_values()
         if self._ai_analysis_enabled and self._current_analysis_key() is not None:
-            self.analysis_status_label.setText("Position changed — updating AI analysis…")
             self.analysis_restart_timer.start()
 
     def _restart_ai_analysis(self) -> None:
         if self._ai_analysis_enabled and self._current_analysis_key() is not None:
             self.analyze_current_position()
 
-    def disable_ai_analysis(self, status: str = "") -> None:
+    def disable_ai_analysis(self, _status: str = "") -> None:
         self.analysis_restart_timer.stop()
         self._ai_analysis_enabled = False
         self.katago_client.cancel()
@@ -1790,14 +1806,11 @@ class PositionEditor(QWidget):
         self.image_gallery.sgf_board.set_ai_enabled(False)
         self.image_gallery.sgf_board.set_move_overlays(())
         self._clear_analysis_values()
-        self.analysis_status_label.setStyleSheet("color: #52636e; font-size: 10px;")
-        self.analysis_status_label.setText(status or "AI is off")
 
     def _clear_analysis_values(self) -> None:
         self.analysis_score_value.setText("—")
         self.analysis_winrate_value.setText("—")
         self.analysis_visits_value.setText("—")
-        self.analysis_status_label.show()
 
     def shutdown_analysis(self) -> None:
         self.disable_ai_analysis()
@@ -2252,7 +2265,10 @@ class PositionEditor(QWidget):
     @staticmethod
     def _has_text_input_focus(widget: QWidget | None) -> bool:
         while widget is not None:
-            if isinstance(widget, (QLineEdit, QTextEdit, QPlainTextEdit)):
+            if isinstance(
+                widget,
+                (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractItemView),
+            ):
                 return True
             widget = widget.parentWidget()
         return False
@@ -2261,8 +2277,130 @@ class PositionEditor(QWidget):
         self, _old: QWidget | None, current: QWidget | None
     ) -> None:
         enabled = not self._has_text_input_focus(current)
-        self.previous_solution_shortcut.setEnabled(enabled)
-        self.next_solution_shortcut.setEnabled(enabled)
+        for shortcut in self.editor_shortcuts:
+            shortcut.setEnabled(enabled)
+
+    def _click_board_tool(self, tool: str) -> None:
+        board = self.image_gallery.sgf_board
+        button = board.edit_mode_buttons[tool]
+        if button.isEnabled():
+            board._activate_board_tool(tool)
+
+    def _click_annotation_tool(self, tool: str) -> None:
+        board = self.image_gallery.sgf_board
+        button = board.annotation_buttons[tool]
+        if button.isEnabled():
+            board._activate_board_tool(tool)
+
+    def _play_pass(self) -> None:
+        button = self.image_gallery.sgf_board.pass_button
+        if button.isEnabled():
+            button.click()
+
+    def _toggle_ai_analysis(self) -> None:
+        board = self.image_gallery.sgf_board
+        if (
+            board.ai_button.isEnabled()
+            and self.image_gallery.media_stack.currentWidget() is board
+        ):
+            board.ai_button.click()
+
+    def _delete_current_sgf_node(self) -> None:
+        board = self.image_gallery.sgf_board
+        if (
+            board.delete_node_button.isEnabled()
+            and self.image_gallery.media_stack.currentWidget() is board
+        ):
+            board.delete_current_node()
+
+    def _refresh_starting_view(self) -> None:
+        board = self.image_gallery.sgf_board
+        if (
+            board.refresh_button.isEnabled()
+            and self.image_gallery.media_stack.currentWidget() is board
+        ):
+            board.refresh_start()
+
+    def _save_current_node_as_start(self) -> None:
+        if (
+            self.image_gallery.media_stack.currentWidget()
+            is self.image_gallery.sgf_board
+        ):
+            self.set_current_node_as_selected_start()
+
+    def toggle_displayed_media(self) -> None:
+        board = self.image_gallery.sgf_board
+        if self.image_gallery.media_stack.currentWidget() is board:
+            if self._selected_has_image():
+                self._set_selected_media_kind("image")
+        elif self._has_sgf():
+            self._set_selected_media_kind("board")
+
+    def copy_displayed_media(self) -> None:
+        clipboard = QApplication.clipboard()
+        if self.image_gallery.media_stack.currentWidget() is self.image_gallery.sgf_board:
+            text = self._current_sgf_text()
+            if text:
+                clipboard.setText(text)
+                return
+        else:
+            image = self._selected_pixmap().toImage()
+            if not image.isNull():
+                clipboard.setImage(image)
+                return
+        QMessageBox.information(
+            self,
+            "Copy Starting View",
+            "The displayed starting view has no SGF or image to copy.",
+        )
+
+    def paste_clipboard_media(self) -> None:
+        if not self.current_position_id:
+            return
+        clipboard = QApplication.clipboard()
+        image = clipboard.image(QClipboard.Clipboard)
+        if not image.isNull():
+            if self._selected_has_image() and QMessageBox.question(
+                self,
+                "Replace Starting-View Image",
+                "This starting view already has an image. Replace it with the clipboard image?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            ) != QMessageBox.Yes:
+                return
+            self.paste_selected_image()
+            return
+
+        text = clipboard.text(QClipboard.Clipboard).strip()
+        try:
+            if not text:
+                raise ValueError
+            load_sgf_text(text)
+        except Exception:
+            QMessageBox.information(
+                self,
+                "Paste Starting View",
+                "The clipboard does not contain an image or valid SGF text.",
+            )
+            return
+        if self._has_sgf() and QMessageBox.question(
+            self,
+            "Replace SGF",
+            "This entry already has an SGF. Replace it with the clipboard SGF?",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        self.pending_sgf_path = None
+        self.pending_sgf_text = text
+        self.clear_sgf_on_save = False
+        self.main_media_kind = "board"
+        self.main_sgf_start_path = []
+        for solution in self.solution_images:
+            solution["sgf_start_path"] = []
+        self._reset_all_scores()
+        self.refresh_gallery(0)
+        self.schedule_autosave()
 
     def _on_description_changed(self) -> None:
         if self._loading:
@@ -2351,7 +2489,6 @@ class PositionEditor(QWidget):
         self.metadata_editor.set_metadata({})
         self.save_status_label.clear()
         self._clear_analysis_values()
-        self.analysis_status_label.setText("AI is off")
         self.refresh_gallery(0)
         self.setEnabled(False)
 

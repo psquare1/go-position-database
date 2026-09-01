@@ -114,7 +114,7 @@ def build_analysis_query(
     *,
     rules: str = "japanese",
     komi: float = 6.5,
-    root_policy_temperature: float = 1.0,
+    root_policy_temperature: float = 1.1,
     report_interval_seconds: float = ANALYSIS_REPORT_INTERVAL_SECONDS,
     request_id: str = "pending",
 ) -> dict[str, Any]:

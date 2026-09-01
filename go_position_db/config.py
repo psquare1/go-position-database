@@ -23,7 +23,7 @@ class KataGoConfig:
     report_interval_seconds: float = 0.1
     overlay_top_moves: int = 5
     overlay_max_point_loss: float = 2.0
-    root_policy_temperature: float = 1.0
+    root_policy_temperature: float = 1.1
     num_analysis_threads: int = 1
     num_search_threads: int = 16
     nn_cache_size_power_of_two: int = 20
@@ -91,7 +91,7 @@ def load_config(root: Path | None = None, config_path: Path | None = None) -> Co
     report_interval_seconds = katago.get("report_interval_seconds", 0.1)
     overlay_top_moves = katago.get("overlay_top_moves", 5)
     overlay_max_point_loss = katago.get("overlay_max_point_loss", 2.0)
-    root_policy_temperature = katago.get("root_policy_temperature", 1.0)
+    root_policy_temperature = katago.get("root_policy_temperature", 1.1)
     num_analysis_threads = katago.get("num_analysis_threads", 1)
     num_search_threads = katago.get("num_search_threads", 16)
     nn_cache_size_power_of_two = katago.get("nn_cache_size_power_of_two", 20)
@@ -268,7 +268,7 @@ katago:
   report_interval_seconds: 0.1
   overlay_top_moves: 5
   overlay_max_point_loss: 2.0
-  root_policy_temperature: 1.0
+  root_policy_temperature: 1.1
   num_analysis_threads: 1
   num_search_threads: 16
   nn_cache_size_power_of_two: 20

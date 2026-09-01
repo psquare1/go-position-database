@@ -8,7 +8,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QObject, QPoint, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QPixmap, QTextCursor
+from PySide6.QtGui import QColor, QImage, QPixmap, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -199,33 +199,33 @@ class GuiTests(unittest.TestCase):
         board.ai_button.click()
         self.assertTrue(board.ai_button.isChecked())
         self.assertEqual(len(client.queries), 1)
-        self.assertEqual(client.queries[0]["rootPolicyTemperature"], 1.0)
+        self.assertEqual(client.queries[0]["rootPolicyTemperature"], 1.1)
         self.assertEqual(client.queries[0]["reportDuringSearchEvery"], 0.1)
         editor._show_analysis(KataGoAnalysis(
             request_id=client.active_request_id,
             current_player="B",
             winrate=0.55,
             score_lead=1.2,
-            visits=2100,
+            visits=32000,
             candidates=(
-                KataGoCandidate("D4", 0, 2000, 0.55, 1.2, 0.0),
-                # Below 1% of the leader despite clearing the absolute minimum.
-                KataGoCandidate("E5", 1, 15, 0.52, -0.3, 1.5),
-                KataGoCandidate("Q16", 2, 30, 0.48, -1.8, 3.0),
+                KataGoCandidate("D4", 0, 30000, 0.55, 1.2, 0.0),
+                # Clears 200 visits, but not 1% of the leader.
+                KataGoCandidate("E5", 1, 250, 0.52, -0.3, 1.5),
+                KataGoCandidate("Q16", 2, 400, 0.48, -1.8, 3.0),
                 # An SGF continuation is included only after clearing both gates.
-                KataGoCandidate("A19", 3, 25, 0.40, -3.8, 5.0),
-                # This move clears the point-loss rule but not ten visits.
-                KataGoCandidate("C3", 4, 9, 0.53, 0.2, 1.0),
+                KataGoCandidate("A19", 3, 350, 0.40, -3.8, 5.0),
+                # This move clears the point-loss rule but not 200 visits.
+                KataGoCandidate("C3", 4, 199, 0.53, 0.2, 1.0),
             ),
             is_final=False,
         ))
         self.assertEqual(editor.analysis_score_value.text(), "B+1.2")
         self.assertEqual(editor.analysis_winrate_value.text(), "B 55.0%")
-        self.assertEqual(editor.analysis_visits_value.text(), "2,100")
-        self.assertTrue(editor.analysis_status_label.isHidden())
+        self.assertEqual(editor.analysis_visits_value.text(), "32,000")
+        self.assertFalse(hasattr(editor, "analysis_status_label"))
         self.assertIs(editor.analysis_box.parentWidget(), editor.details_panel)
         self.assertEqual(editor.main_score, "B +1.2")
-        self.assertEqual(editor.main_score_visits, 2100)
+        self.assertEqual(editor.main_score_visits, 32000)
         self.assertEqual(editor._display_winrate(0.4), "W 60.0%")
         overlays = {item.point: item for item in board.move_overlays}
         self.assertEqual(set(overlays), {(3, 3), (0, 18)})
@@ -245,6 +245,98 @@ class GuiTests(unittest.TestCase):
         board.previous_button.click()
         QTest.qWait(180)
         self.assertEqual(len(client.queries), 2)
+
+    def test_editor_shortcuts_control_board_ai_clipboard_and_starting_view(self):
+        position_id = "p000021"
+        directory = self.cfg.positions_dir / position_id
+        directory.mkdir()
+        (directory / self.cfg.sgf_filename).write_text(
+            "(;GM[1]FF[4]SZ[9];B[ee])", encoding="utf-8"
+        )
+        save_position(self.cfg, position_id, {
+            "description": "",
+            "score": "",
+            "main_media_kind": "board",
+            "sgf_start_path": [],
+            "tags": [],
+            "metadata": {},
+            "solution_images": [],
+        })
+        client = FakeKataGoClient()
+        editor = PositionEditor(self.cfg, katago_client=client)
+        self.assertTrue(editor.load_position(position_id))
+        shortcuts = {
+            shortcut.key().toString(): shortcut for shortcut in editor.editor_shortcuts
+        }
+        expected = {
+            "Ctrl+V", "Shift+A", "Shift+B", "Shift+W", "Shift+E", "Shift+P",
+            "Space", "Backspace", "Del", "Ctrl+Shift+1", "Ctrl+Shift+A",
+            "Ctrl+Shift+T", "Ctrl+Shift+C", "Ctrl+Shift+S", "Ctrl+Shift+X",
+            "Ctrl+C", "Ctrl+R", "Ctrl+S", "Alt+D",
+        }
+        self.assertTrue(expected.issubset(shortcuts))
+
+        board = editor.image_gallery.sgf_board
+        shortcuts["Shift+B"].activated.emit()
+        self.assertEqual(board.edit_tool, "black_setup")
+        shortcuts["Ctrl+Shift+X"].activated.emit()
+        self.assertEqual(board.annotation_tool, "crosses")
+        shortcuts["Space"].activated.emit()
+        self.assertTrue(board.ai_button.isChecked())
+        self.assertEqual(len(client.queries), 1)
+
+        board.next_button.click()
+        shortcuts["Ctrl+S"].activated.emit()
+        self.assertEqual(editor.main_sgf_start_path, [0])
+        board.previous_button.click()
+        shortcuts["Ctrl+R"].activated.emit()
+        self.assertEqual(board.current_frame.node_path, (0,))
+
+        editor.pending_image = QImage(12, 12, QImage.Format_ARGB32)
+        editor.pending_image.fill(QColor("#abcdef"))
+        editor.refresh_gallery(0)
+        shortcuts["Alt+D"].activated.emit()
+        self.assertIs(
+            editor.image_gallery.media_stack.currentWidget(),
+            editor.image_gallery.image_surface,
+        )
+        QApplication.clipboard().clear()
+        shortcuts["Ctrl+C"].activated.emit()
+        self.assertFalse(QApplication.clipboard().image().isNull())
+        shortcuts["Alt+D"].activated.emit()
+        self.assertIs(editor.image_gallery.media_stack.currentWidget(), board)
+
+        QApplication.clipboard().clear()
+        shortcuts["Ctrl+C"].activated.emit()
+        self.assertIn(";B[ee]", QApplication.clipboard().text())
+
+    def test_ctrl_v_accepts_sgf_text_and_warns_before_replacement(self):
+        position_id = "p000022"
+        directory = self.cfg.positions_dir / position_id
+        directory.mkdir()
+        save_position(self.cfg, position_id, {
+            "description": "",
+            "score": "",
+            "tags": [],
+            "metadata": {},
+            "solution_images": [],
+        })
+        editor = PositionEditor(self.cfg, katago_client=FakeKataGoClient())
+        self.assertTrue(editor.load_position(position_id))
+        clipboard = QApplication.clipboard()
+        clipboard.setText("(;GM[1]FF[4]SZ[9];W[dd])")
+        editor.paste_clipboard_media()
+        self.assertEqual(editor.pending_sgf_text, "(;GM[1]FF[4]SZ[9];W[dd])")
+
+        clipboard.setText("(;GM[1]FF[4]SZ[13])")
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.Cancel) as warning:
+            editor.paste_clipboard_media()
+        warning.assert_called_once()
+        self.assertEqual(editor.pending_sgf_text, "(;GM[1]FF[4]SZ[9];W[dd])")
+
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+            editor.paste_clipboard_media()
+        self.assertEqual(editor.pending_sgf_text, "(;GM[1]FF[4]SZ[13])")
 
     def test_tag_manager_delete_refreshes_and_removes_position_references(self):
         position_id = "p000010"
@@ -460,33 +552,32 @@ class GuiTests(unittest.TestCase):
                 score_lead=score, visits=visits, candidates=(), is_final=False,
             )
 
-        editor._store_analysis_score(analysis(3.0, 99))
-        editor._store_analysis_score(analysis(3.0, 150))
+        editor._store_analysis_score(analysis(3.0, 999))
         self.assertEqual(editor.main_score, "W +9")
         self.assertEqual(editor.main_score_visits, 150)
 
-        editor._store_analysis_score(analysis(3.0, 151))
+        editor._store_analysis_score(analysis(3.0, 1000))
         self.assertEqual(editor.main_score, "B +3.0")
-        self.assertEqual(editor.main_score_visits, 151)
+        self.assertEqual(editor.main_score_visits, 1000)
 
         board = editor.image_gallery.sgf_board
         board.next_button.click()
-        editor._store_analysis_score(analysis(-2.0, 500))
+        editor._store_analysis_score(analysis(-2.0, 1500))
         self.assertEqual(editor.main_score, "B +3.0")
-        self.assertEqual(editor.main_score_visits, 151)
+        self.assertEqual(editor.main_score_visits, 1000)
 
         editor.set_selected_sgf_start_path(list(board.current_frame.node_path))
         self.assertEqual(editor.main_score, "")
         self.assertEqual(editor.main_score_visits, 0)
 
         editor.refresh_gallery(1)
-        editor._store_analysis_score(analysis(-1.5, 200))
+        editor._store_analysis_score(analysis(-1.5, 1200))
         self.assertEqual(editor.solution_images[0]["score"], "W +1.5")
-        self.assertEqual(editor.solution_images[0]["score_visits"], 200)
+        self.assertEqual(editor.solution_images[0]["score_visits"], 1200)
         self.assertTrue(editor.flush_autosave())
         stored = load_position(self.cfg, position_id)
         self.assertEqual(stored["solution_images"][0]["score"], "W +1.5")
-        self.assertEqual(stored["solution_images"][0]["score_visits"], 200)
+        self.assertEqual(stored["solution_images"][0]["score_visits"], 1200)
         editor.close()
 
     def test_standard_view_uses_three_columns(self):
@@ -583,7 +674,7 @@ class GuiTests(unittest.TestCase):
         self.assertTrue((directory / self.cfg.sgf_filename).exists())
         self.assertFalse((directory / "downloaded-game.sgf").exists())
         self.assertIs(window.editor.save_status_label.parentWidget(), window.statusBar())
-        self.assertIsNot(window.editor.analysis_status_label.parentWidget(), window.statusBar())
+        self.assertFalse(hasattr(window.editor, "analysis_status_label"))
         self.assertIs(window.editor.analysis_box.parentWidget(), window.editor.details_panel)
         window.close()
 
