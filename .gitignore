@@ -1,4 +1,5 @@
 generated/
+analysis_logs/
 positions/
 config.yaml
 tags.yaml

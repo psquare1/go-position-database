@@ -12,7 +12,7 @@ import yaml
 from .config import Config
 
 RESERVED_POSITION_KEYS = {
-    "description", "score", "main_media_kind", "sgf_start_path",
+    "description", "score", "score_visits", "main_media_kind", "sgf_start_path",
     "tags", "metadata", "solution_images",
 }
 
@@ -193,6 +193,12 @@ def normalized_sgf_start_path(value: Any, label: str = "SGF start path") -> list
     return list(value)
 
 
+def normalized_score_visits(value: Any, label: str = "Score visits") -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise DatabaseError(f"{label} must be a non-negative integer.")
+    return value
+
+
 def normalize_position_record(value: Any) -> dict[str, Any]:
     if value is None:
         value = {}
@@ -203,6 +209,7 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
     result.pop("name", None)
     result.setdefault("description", "")
     result.setdefault("score", "")
+    result.setdefault("score_visits", 0)
     result.setdefault("main_media_kind", "board")
     result.setdefault("sgf_start_path", [])
     result.setdefault("tags", [])
@@ -215,6 +222,9 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
         result["score"] = normalized_score
     elif not isinstance(result["score"], str):
         raise DatabaseError("Entry 'score' must be a score string or a positive/negative number.")
+    result["score_visits"] = normalized_score_visits(
+        result["score_visits"], "Entry 'score_visits'"
+    )
     if result["main_media_kind"] not in {"board", "image"}:
         raise DatabaseError("Entry 'main_media_kind' must be 'board' or 'image'.")
     result["sgf_start_path"] = normalized_sgf_start_path(
@@ -237,6 +247,9 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
         file_value = item.get("file", "")
         description = item.get("description", "")
         score = item.get("score", "")
+        score_visits = normalized_score_visits(
+            item.get("score_visits", 0), f"Variation {index} 'score_visits'"
+        )
         sgf_start_path = normalized_sgf_start_path(
             item.get("sgf_start_path", []), f"Variation {index} 'sgf_start_path'"
         )
@@ -261,6 +274,7 @@ def normalize_position_record(value: Any) -> dict[str, Any]:
             "file": relative.as_posix() if relative is not None else "",
             "description": description,
             "score": score,
+            "score_visits": score_visits,
             "sgf_start_path": sgf_start_path,
         })
     result["solution_images"] = normalized_solutions

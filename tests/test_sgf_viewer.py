@@ -7,15 +7,19 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt
-from PySide6.QtGui import QImage, QPainter, QPixmap
+from PySide6.QtGui import QImage, QPainter, QPixmap, QRegion
 from PySide6.QtWidgets import QApplication, QToolButton
 from PySide6.QtTest import QTest
 
 from go_position_db.gui import PositionImageGallery
 from go_position_db.sgf_viewer import (
+    BoardMoveOverlay,
     COORD_ROOM_RATIO,
+    MOVE_LOSS_GRADIENT_MAX,
     STONE_ROOM_RATIO,
     ReadOnlySgfBoard,
+    _move_overlay_fill_color,
+    _move_overlay_foreground_color,
     _effective_markup,
     _last_move_marker_visible,
     insert_setup_position,
@@ -42,6 +46,55 @@ class SgfViewerTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.sgf_path = Path(self.tmp.name) / "position.sgf"
         self.sgf_path.write_text(CAPTURE_SGF, encoding="utf-8")
+
+    def test_overlay_snapshots_invalidate_only_circle_regions(self):
+        class TrackingBoard(ReadOnlySgfBoard):
+            def __init__(self):
+                self.update_arguments = []
+                super().__init__()
+
+            def update(self, *arguments):
+                self.update_arguments.append(arguments)
+                return super().update(*arguments)
+
+        board = TrackingBoard()
+        board.resize(900, 850)
+        board.load_file(self.sgf_path)
+        board.update_arguments.clear()
+
+        board.set_move_overlays([
+            BoardMoveOverlay((3, 3), 0.0, True),
+            BoardMoveOverlay((4, 4), 0.8),
+        ])
+
+        self.assertEqual(len(board.update_arguments), 1)
+        dirty_region = board.update_arguments[0][0]
+        self.assertIsInstance(dirty_region, QRegion)
+        dirty_bounds = dirty_region.boundingRect()
+        self.assertLess(dirty_bounds.width(), board.width() // 3)
+        self.assertLess(dirty_bounds.height(), board.height() // 3)
+
+    def test_move_overlay_palette_is_player_aware_and_loss_scaled(self):
+        black_best = BoardMoveOverlay((3, 3), 0.0, True, player="B")
+        white_best = BoardMoveOverlay((3, 3), 0.0, True, player="W")
+        self.assertEqual(_move_overlay_fill_color(black_best).name(), "#b9e5ff")
+        self.assertEqual(_move_overlay_fill_color(white_best).name(), "#176a9f")
+        self.assertEqual(_move_overlay_foreground_color("B").name(), "#171819")
+        self.assertEqual(_move_overlay_foreground_color("W").name(), "#fffdf8")
+
+        green = _move_overlay_fill_color(
+            BoardMoveOverlay((3, 3), 0.0, player="B")
+        )
+        midpoint = _move_overlay_fill_color(
+            BoardMoveOverlay((3, 3), MOVE_LOSS_GRADIENT_MAX / 2, player="B")
+        )
+        red = _move_overlay_fill_color(
+            BoardMoveOverlay((3, 3), MOVE_LOSS_GRADIENT_MAX, player="B")
+        )
+        self.assertGreater(green.green(), green.red())
+        self.assertGreater(midpoint.red(), midpoint.blue())
+        self.assertGreater(midpoint.green(), midpoint.blue())
+        self.assertGreater(red.red(), red.green())
 
     def tearDown(self):
         self.tmp.cleanup()

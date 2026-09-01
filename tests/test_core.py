@@ -49,6 +49,16 @@ class CoreTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_init_keeps_application_config_out_of_database_root(self):
+        from go_position_db.cli import _ensure_root_files
+
+        database_root = Path(self.tmp.name) / "new-database"
+        _ensure_root_files(database_root, force=False)
+        self.assertTrue((database_root / "positions").is_dir())
+        self.assertTrue((database_root / "generated").is_dir())
+        self.assertTrue((database_root / "tags.yaml").is_file())
+        self.assertFalse((database_root / "config.yaml").exists())
+
     def test_inheritance_search(self):
         db = GoPositionDatabase(self.cfg)
         self.assertEqual(db.search("joseki"), ["p1", "p2"])
@@ -134,6 +144,7 @@ class CoreTests(unittest.TestCase):
         record.update({
             "name": "Retired display name",
             "score": "B +3.5",
+            "score_visits": 500,
             "main_media_kind": "image",
             "sgf_start_path": [0, 1],
             "solution_images": [
@@ -141,6 +152,7 @@ class CoreTests(unittest.TestCase):
                     "file": "solutions/solution-001.png",
                     "description": "White resists",
                     "score": "W +1.5",
+                    "score_visits": 300,
                     "sgf_start_path": [0, 1, 2],
                 },
                 {
@@ -158,6 +170,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(loaded["main_media_kind"], "image")
         self.assertEqual(loaded["sgf_start_path"], [0, 1])
         self.assertEqual(loaded["solution_images"][0]["score"], "W +1.5")
+        self.assertEqual(loaded["score_visits"], 500)
+        self.assertEqual(loaded["solution_images"][0]["score_visits"], 300)
         self.assertEqual(loaded["solution_images"][0]["sgf_start_path"], [0, 1, 2])
         self.assertEqual(loaded["solution_images"][1]["kind"], "board")
         self.assertEqual(loaded["solution_images"][1]["file"], "")

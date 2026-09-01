@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from .config import DEFAULT_ROOT, default_config_yaml, load_config
+from .config import DEFAULT_CONFIG_PATH, DEFAULT_ROOT, load_config
 from .database import GoPositionDatabase
 from .recognition import RecognitionError
 from .storage import (
@@ -35,11 +35,14 @@ def parser() -> argparse.ArgumentParser:
         description="Tag, validate, and search a filesystem database of annotated Go study entries.",
     )
     p.add_argument("--root", type=Path, default=None, help=f"Database root (default: GO_POSITION_DB_ROOT or {DEFAULT_ROOT})")
-    p.add_argument("--config", type=Path, default=None, help="Optional path to config.yaml")
+    p.add_argument(
+        "--config", type=Path, default=None,
+        help=f"Application config (default: {DEFAULT_CONFIG_PATH})",
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
-    init = sub.add_parser("init", help="Create the database folders and starter config/tag files.")
-    init.add_argument("--force", action="store_true", help="Overwrite starter config/tags files if present.")
+    init = sub.add_parser("init", help="Create the database folders and starter tags file.")
+    init.add_argument("--force", action="store_true", help="Overwrite the starter tags file if present.")
 
     sub.add_parser("gui", help="Launch the local PySide6 desktop UI.")
 
@@ -149,10 +152,7 @@ def _ensure_root_files(root: Path, force: bool) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "positions").mkdir(exist_ok=True)
     (root / "generated").mkdir(exist_ok=True)
-    cfg = root / "config.yaml"
     tags = root / "tags.yaml"
-    if force or not cfg.exists():
-        cfg.write_text(default_config_yaml(), encoding="utf-8")
     if force or not tags.exists():
         tags.write_text("tags: {}\n", encoding="utf-8")
 

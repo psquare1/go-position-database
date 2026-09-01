@@ -1,4 +1,5 @@
 import os
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -6,17 +7,25 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QObject, QPoint, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPixmap, QTextCursor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QLabel, QPlainTextEdit
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QLabel,
+    QPlainTextEdit,
+    QPushButton,
+)
 
-from go_position_db.config import Config
+from go_position_db.config import Config, KataGoConfig, load_config
 from go_position_db.database import GoPositionDatabase
 from go_position_db.dialogs import SilentMessageBox as QMessageBox
 from go_position_db.gui import (
     DISPLAY_MODES,
     ElidedLabel,
+    KataGoSettingsPage,
+    MetadataKeyValueEditor,
     PositionEditor,
     PositionImageGallery,
     SearchResultCard,
@@ -27,6 +36,7 @@ from go_position_db.gui import (
     MainWindow,
     score_chip_stylesheet,
 )
+from go_position_db.katago import KataGoAnalysis, KataGoCandidate
 from go_position_db.recognition import (
     RecognitionError,
     RecognitionResult,
@@ -34,6 +44,45 @@ from go_position_db.recognition import (
 )
 from go_position_db.storage import atomic_dump_yaml, load_position, save_position
 from go_position_db.tags import TagGraph
+
+
+class FakeKataGoClient(QObject):
+    analysis_ready = Signal(object)
+    analysis_progress = Signal(object)
+    analysis_failed = Signal(str)
+    busy_changed = Signal(bool)
+    engine_ready = Signal(str)
+    engine_failed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.queries = []
+        self.cancel_count = 0
+        self.start_count = 0
+        self._active_request_id = None
+
+    @property
+    def active_request_id(self):
+        return self._active_request_id
+
+    def analyze(self, query):
+        self.queries.append(query)
+        self._active_request_id = f"request-{len(self.queries)}"
+        self.busy_changed.emit(True)
+        return self._active_request_id
+
+    def start(self):
+        self.start_count += 1
+
+    def cancel(self):
+        self.cancel_count += 1
+        was_active = self._active_request_id is not None
+        self._active_request_id = None
+        if was_active:
+            self.busy_changed.emit(False)
+
+    def shutdown(self):
+        self.cancel()
 
 
 class GuiTests(unittest.TestCase):
@@ -76,6 +125,126 @@ class GuiTests(unittest.TestCase):
         manager.select_or_create_filter_tag()
         self.assertEqual(manager._current_tag(), "new-tag")
         self.assertTrue(TagGraph(self.cfg).has("new-tag"))
+
+    def test_katago_settings_validate_save_and_emit_resolved_configuration(self):
+        root = Path(self.tmp.name)
+        executable = root / ("katago.exe" if os.name == "nt" else "katago")
+        model = root / "model.bin.gz"
+        analysis_config = root / "analysis.cfg"
+        for path in (executable, model, analysis_config):
+            path.write_bytes(b"fixture")
+        if os.name != "nt":
+            executable.chmod(0o755)
+        config_path = root / "application" / "config.yaml"
+        page = KataGoSettingsPage(KataGoConfig(), config_path)
+        page.executable_edit.setText(str(executable))
+        page.model_edit.setText(str(model))
+        page.analysis_config_edit.setText(str(analysis_config))
+        page.response_timeout_spin.setValue(12)
+        page.startup_timeout_spin.setValue(240)
+        page.report_interval_spin.setValue(0.2)
+        page.overlay_top_moves_spin.setValue(7)
+        page.overlay_point_loss_spin.setValue(3.5)
+        page.root_policy_temperature_spin.setValue(1.4)
+        page.analysis_threads_spin.setValue(1)
+        page.search_threads_spin.setValue(12)
+        page.nn_cache_spin.setValue(19)
+        saved = []
+        page.saved.connect(saved.append)
+
+        page.save_settings()
+
+        self.assertEqual(page.status_label.text(), "Settings validated, saved, and applied.")
+        self.assertEqual(len(saved), 1)
+        loaded = load_config(root, config_path=config_path)
+        self.assertEqual(loaded.katago.executable, executable)
+        self.assertEqual(loaded.katago.timeout_seconds, 12)
+        self.assertEqual(loaded.katago.startup_timeout_seconds, 240)
+        self.assertEqual(loaded.katago.report_interval_seconds, 0.2)
+        self.assertEqual(loaded.katago.overlay_top_moves, 7)
+        self.assertEqual(loaded.katago.overlay_max_point_loss, 3.5)
+        self.assertEqual(loaded.katago.root_policy_temperature, 1.4)
+        self.assertEqual(loaded.katago.num_search_threads, 12)
+        self.assertEqual(loaded.katago.nn_cache_size_power_of_two, 19)
+
+    def test_ai_toggle_overlays_candidates_and_follows_sgf_navigation(self):
+        position_id = "p000020"
+        directory = self.cfg.positions_dir / position_id
+        directory.mkdir()
+        (directory / self.cfg.sgf_filename).write_text(
+            "(;GM[1]FF[4]SZ[19](;B[aa])(;B[bb]))", encoding="utf-8"
+        )
+        save_position(self.cfg, position_id, {
+            "description": "",
+            "score": "",
+            "main_media_kind": "board",
+            "sgf_start_path": [],
+            "tags": [],
+            "metadata": {},
+            "solution_images": [],
+        })
+        configured = replace(
+            self.cfg,
+            katago=KataGoConfig(
+                overlay_top_moves=1,
+                overlay_max_point_loss=2.0,
+            ),
+        )
+        client = FakeKataGoClient()
+        editor = PositionEditor(configured, katago_client=client)
+        self.assertTrue(editor.load_position(position_id))
+        board = editor.image_gallery.sgf_board
+        self.assertIs(board.ai_button.parentWidget(), board.controls)
+
+        board.ai_button.click()
+        self.assertTrue(board.ai_button.isChecked())
+        self.assertEqual(len(client.queries), 1)
+        self.assertEqual(client.queries[0]["rootPolicyTemperature"], 1.0)
+        self.assertEqual(client.queries[0]["reportDuringSearchEvery"], 0.1)
+        editor._show_analysis(KataGoAnalysis(
+            request_id=client.active_request_id,
+            current_player="B",
+            winrate=0.55,
+            score_lead=1.2,
+            visits=2100,
+            candidates=(
+                KataGoCandidate("D4", 0, 2000, 0.55, 1.2, 0.0),
+                # Below 1% of the leader despite clearing the absolute minimum.
+                KataGoCandidate("E5", 1, 15, 0.52, -0.3, 1.5),
+                KataGoCandidate("Q16", 2, 30, 0.48, -1.8, 3.0),
+                # An SGF continuation is included only after clearing both gates.
+                KataGoCandidate("A19", 3, 25, 0.40, -3.8, 5.0),
+                # This move clears the point-loss rule but not ten visits.
+                KataGoCandidate("C3", 4, 9, 0.53, 0.2, 1.0),
+            ),
+            is_final=False,
+        ))
+        self.assertEqual(editor.analysis_score_value.text(), "B+1.2")
+        self.assertEqual(editor.analysis_winrate_value.text(), "B 55.0%")
+        self.assertEqual(editor.analysis_visits_value.text(), "2,100")
+        self.assertTrue(editor.analysis_status_label.isHidden())
+        self.assertIs(editor.analysis_box.parentWidget(), editor.details_panel)
+        self.assertEqual(editor.main_score, "B +1.2")
+        self.assertEqual(editor.main_score_visits, 2100)
+        self.assertEqual(editor._display_winrate(0.4), "W 60.0%")
+        overlays = {item.point: item for item in board.move_overlays}
+        self.assertEqual(set(overlays), {(3, 3), (0, 18)})
+        self.assertTrue(overlays[(3, 3)].is_best)
+        self.assertEqual(overlays[(3, 3)].player, "B")
+        self.assertEqual(overlays[(0, 18)].point_loss, 5.0)
+        self.assertNotIn((1, 17), overlays)
+
+        board.next_button.click()
+        QTest.qWait(180)
+        self.assertTrue(board.ai_button.isChecked())
+        self.assertEqual(len(client.queries), 2)
+        self.assertEqual(board.move_overlays, ())
+
+        board.ai_button.click()
+        self.assertFalse(board.ai_button.isChecked())
+        board.previous_button.click()
+        QTest.qWait(180)
+        self.assertEqual(len(client.queries), 2)
 
     def test_tag_manager_delete_refreshes_and_removes_position_references(self):
         position_id = "p000010"
@@ -225,6 +394,101 @@ class GuiTests(unittest.TestCase):
         self.assertNotIn("not-created", editor.tags())
         self.assertFalse(TagGraph(self.cfg).has("not-created"))
 
+    def test_compact_metadata_editor_keeps_one_editable_blank_row(self):
+        editor = MetadataKeyValueEditor()
+        editor.set_metadata({"source": "book"})
+        self.assertEqual(editor.table.rowCount(), 2)
+        self.assertEqual(editor.table.item(1, 0).text(), "")
+        self.assertEqual(editor.findChildren(QPushButton), [])
+
+        editor.table.item(1, 0).setText("move")
+        editor.table.item(1, 1).setText("42")
+        self.assertEqual(editor.metadata(), {"source": "book", "move": 42})
+        self.assertEqual(editor.table.rowCount(), 3)
+
+        editor.table.item(1, 0).setText("")
+        editor.table.item(1, 1).setText("")
+        self.assertEqual(editor.metadata(), {"source": "book"})
+        self.assertEqual(editor.table.rowCount(), 2)
+
+    def test_tag_chips_remove_themselves_without_action_buttons(self):
+        editor = TagSetEditor(self.cfg)
+        editor.set_available_tags(["joseki", "sente"])
+        self.assertTrue(editor.add_edit._boolean_query_mode)
+        editor.set_tags(["joseki", "sente"])
+        editor.resize(360, 130)
+        editor.show()
+        self.app.processEvents()
+        self.assertEqual(editor.findChildren(QPushButton), [])
+
+        first_rect = editor.list_widget.visualItemRect(editor.list_widget.item(0))
+        QTest.mouseClick(
+            editor.list_widget.viewport(),
+            Qt.LeftButton,
+            pos=QPoint(first_rect.right() - 10, first_rect.center().y()),
+        )
+        self.assertEqual(editor.tags(), ["sente"])
+
+        editor.list_widget.item(0).setSelected(True)
+        editor.list_widget.setFocus()
+        QTest.keyClick(editor.list_widget, Qt.Key_Delete)
+        self.assertEqual(editor.tags(), [])
+        editor.close()
+
+    def test_ai_score_requires_primary_node_and_increasing_visit_count(self):
+        position_id = "p000021"
+        directory = self.cfg.positions_dir / position_id
+        directory.mkdir()
+        (directory / self.cfg.sgf_filename).write_text(
+            "(;GM[1]FF[4]SZ[9];B[ee];W[gc])", encoding="utf-8"
+        )
+        save_position(self.cfg, position_id, {
+            "description": "", "score": "W +9", "score_visits": 150,
+            "main_media_kind": "board", "sgf_start_path": [],
+            "tags": [], "metadata": {}, "solution_images": [{
+                "kind": "board", "file": "", "description": "",
+                "score": "B +1", "score_visits": 100,
+                "sgf_start_path": [0],
+            }],
+        })
+        editor = PositionEditor(self.cfg, katago_client=FakeKataGoClient())
+        self.assertTrue(editor.load_position(position_id))
+
+        def analysis(score, visits):
+            return KataGoAnalysis(
+                request_id="fixture", current_player="B", winrate=0.5,
+                score_lead=score, visits=visits, candidates=(), is_final=False,
+            )
+
+        editor._store_analysis_score(analysis(3.0, 99))
+        editor._store_analysis_score(analysis(3.0, 150))
+        self.assertEqual(editor.main_score, "W +9")
+        self.assertEqual(editor.main_score_visits, 150)
+
+        editor._store_analysis_score(analysis(3.0, 151))
+        self.assertEqual(editor.main_score, "B +3.0")
+        self.assertEqual(editor.main_score_visits, 151)
+
+        board = editor.image_gallery.sgf_board
+        board.next_button.click()
+        editor._store_analysis_score(analysis(-2.0, 500))
+        self.assertEqual(editor.main_score, "B +3.0")
+        self.assertEqual(editor.main_score_visits, 151)
+
+        editor.set_selected_sgf_start_path(list(board.current_frame.node_path))
+        self.assertEqual(editor.main_score, "")
+        self.assertEqual(editor.main_score_visits, 0)
+
+        editor.refresh_gallery(1)
+        editor._store_analysis_score(analysis(-1.5, 200))
+        self.assertEqual(editor.solution_images[0]["score"], "W +1.5")
+        self.assertEqual(editor.solution_images[0]["score_visits"], 200)
+        self.assertTrue(editor.flush_autosave())
+        stored = load_position(self.cfg, position_id)
+        self.assertEqual(stored["solution_images"][0]["score"], "W +1.5")
+        self.assertEqual(stored["solution_images"][0]["score_visits"], 200)
+        editor.close()
+
     def test_standard_view_uses_three_columns(self):
         self.assertEqual(DISPLAY_MODES["Standard"].columns, 3)
 
@@ -319,6 +583,8 @@ class GuiTests(unittest.TestCase):
         self.assertTrue((directory / self.cfg.sgf_filename).exists())
         self.assertFalse((directory / "downloaded-game.sgf").exists())
         self.assertIs(window.editor.save_status_label.parentWidget(), window.statusBar())
+        self.assertIsNot(window.editor.analysis_status_label.parentWidget(), window.statusBar())
+        self.assertIs(window.editor.analysis_box.parentWidget(), window.editor.details_panel)
         window.close()
 
     def test_sgf_markup_edits_are_saved_to_the_position_copy(self):

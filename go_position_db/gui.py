@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import yaml
+from pysgf import Move
 from PySide6.QtCore import (
     QEvent,
+    QPoint,
     QPointF,
     QRect,
     QRectF,
@@ -43,6 +46,7 @@ from PySide6.QtWidgets import (
     QCompleter,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -61,6 +65,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QStyle,
     QStyleOptionFrame,
@@ -75,9 +80,22 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
-from .config import DEFAULT_ROOT, load_config
+from .config import (
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_ROOT,
+    KataGoConfig,
+    load_config,
+    save_katago_config,
+)
 from .database import GoPositionDatabase
 from .dialogs import SilentMessageBox as QMessageBox
+from .katago import (
+    KataGoAnalysis,
+    KataGoClient,
+    KataGoError,
+    build_analysis_query,
+    validate_katago_config,
+)
 from .recognition import (
     LIZGOBAN_HTML,
     RecognitionError,
@@ -99,6 +117,7 @@ from .storage import (
     save_position,
 )
 from .sgf_viewer import (
+    BoardMoveOverlay,
     ReadOnlySgfBoard,
     insert_setup_position,
     media_card_rects,
@@ -387,15 +406,70 @@ class TagChipDelegate(QStyledItemDelegate):
         painter.drawText(rect, Qt.AlignCenter, str(index.data()))
         painter.restore()
 
-def configure_tag_chip_list(widget: QListWidget, selectable: bool = True) -> None:
+
+class RemovableTagChipDelegate(TagChipDelegate):
+    remove_requested = Signal(int)
+
+    def sizeHint(self, option, index):  # type: ignore[override]
+        metrics = option.fontMetrics
+        return QSize(metrics.horizontalAdvance(str(index.data())) + 39, 29)
+
+    @staticmethod
+    def _close_rect(option) -> QRect:
+        return QRect(option.rect.right() - 22, option.rect.top() + 2, 20, option.rect.height() - 4)
+
+    def paint(self, painter, option, index) -> None:  # type: ignore[override]
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        selected = bool(option.state & QStyle.State_Selected)
+        rect = option.rect.adjusted(2, 2, -2, -2)
+        painter.setPen(QPen(QColor("#c77f9b" if selected else "#dfa7ba"), 1))
+        painter.setBrush(QColor("#edbfd0" if selected else "#f6dce5"))
+        painter.drawRoundedRect(rect, 12, 12)
+        painter.setPen(QColor("#4f2636" if selected else "#683748"))
+        painter.drawText(
+            rect.adjusted(10, 0, -22, 0),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            str(index.data()),
+        )
+        close_rect = self._close_rect(option)
+        painter.setPen(QPen(QColor(140, 82, 104, 175), 1.0, Qt.SolidLine, Qt.RoundCap))
+        center = close_rect.center()
+        offset = QPoint(3, 3)
+        painter.drawLine(
+            center - offset,
+            center + offset,
+        )
+        painter.drawLine(
+            center + QPoint(-offset.x(), offset.y()),
+            center + QPoint(offset.x(), -offset.y()),
+        )
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index) -> bool:  # type: ignore[override]
+        if (
+            event.type() == QEvent.MouseButtonRelease
+            and event.button() == Qt.LeftButton
+            and self._close_rect(option).contains(event.position().toPoint())
+        ):
+            self.remove_requested.emit(index.row())
+            return True
+        return super().editorEvent(event, model, option, index)
+
+
+def configure_tag_chip_list(
+    widget: QListWidget, selectable: bool = True, removable: bool = False
+) -> TagChipDelegate:
     widget.setFlow(QListWidget.LeftToRight)
     widget.setWrapping(True)
     widget.setResizeMode(QListWidget.Adjust)
     widget.setMovement(QListWidget.Static)
     widget.setSpacing(2)
     widget.setSelectionMode(QAbstractItemView.ExtendedSelection if selectable else QAbstractItemView.NoSelection)
-    widget.setItemDelegate(TagChipDelegate(widget))
+    delegate = RemovableTagChipDelegate(widget) if removable else TagChipDelegate(widget)
+    widget.setItemDelegate(delegate)
     widget.setStyleSheet(TAG_LIST_STYLESHEET)
+    return delegate
 
 
 class TagChipDisplay(QWidget):
@@ -461,26 +535,18 @@ class MetadataKeyValueEditor(QWidget):
         layout.setSpacing(6)
 
         self.table = QTableWidget(0, 2)
-        self.table.horizontalHeader().setVisible(False)
+        self.table.setHorizontalHeaderLabels(["Field", "Value"])
+        self.table.horizontalHeader().setVisible(True)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setMinimumHeight(150)
+        self.table.setMinimumHeight(92)
+        self.table.setMaximumHeight(150)
         layout.addWidget(self.table, 1)
 
-        buttons = QHBoxLayout()
-        self.add_button = QPushButton("Add field")
-        self.remove_button = QPushButton("Remove selected")
-        buttons.addWidget(self.add_button)
-        buttons.addWidget(self.remove_button)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
-
         self.table.itemChanged.connect(self._on_item_changed)
-        self.add_button.clicked.connect(self.add_row)
-        self.remove_button.clicked.connect(self.remove_selected)
         self.set_metadata({})
 
     def set_metadata(self, metadata: dict[str, Any]) -> None:
@@ -488,8 +554,7 @@ class MetadataKeyValueEditor(QWidget):
         self.table.setRowCount(0)
         for key, value in metadata.items():
             self._append_row(str(key), self._format_value(value))
-        if not metadata:
-            self._append_row("", "")
+        self._append_row("", "")
         self._loading = False
 
     def metadata(self) -> dict[str, Any]:
@@ -528,9 +593,27 @@ class MetadataKeyValueEditor(QWidget):
         self.table.setItem(row, 0, QTableWidgetItem(key))
         self.table.setItem(row, 1, QTableWidgetItem(value))
 
+    def _row_is_blank(self, row: int) -> bool:
+        return all(
+            not (self.table.item(row, column).text().strip() if self.table.item(row, column) else "")
+            for column in range(2)
+        )
+
+    def _normalize_rows(self) -> None:
+        self._loading = True
+        try:
+            for row in range(self.table.rowCount() - 1, -1, -1):
+                if self._row_is_blank(row):
+                    self.table.removeRow(row)
+            self._append_row("", "")
+        finally:
+            self._loading = False
+
     def _on_item_changed(self) -> None:
-        if not self._loading:
-            self.changed.emit()
+        if self._loading:
+            return
+        self._normalize_rows()
+        self.changed.emit()
 
     @staticmethod
     def _format_value(value: Any) -> str:
@@ -569,29 +652,23 @@ class TagSetEditor(QWidget):
         self.available_tags: list[str] = []
 
         layout = QVBoxLayout(self)
-        row = QHBoxLayout()
         self.add_edit = TagQueryLineEdit()
-        self.add_edit.setPlaceholderText("Type a tag and press Add or Enter")
-        self.add_button = QPushButton("Add")
-        row.addWidget(self.add_edit)
-        row.addWidget(self.add_button)
-        layout.addLayout(row)
+        self.add_edit.set_boolean_query_mode()
+        self.add_edit.setPlaceholderText("Type a tag and press Enter")
+        layout.addWidget(self.add_edit)
 
         self.list_widget = QListWidget()
-        configure_tag_chip_list(self.list_widget)
+        self.tag_delegate = configure_tag_chip_list(
+            self.list_widget, removable=True
+        )
+        self.list_widget.setToolTip("Click × or press Delete to remove a tag")
+        self.list_widget.setMinimumHeight(58)
+        self.list_widget.setMaximumHeight(92)
+        self.list_widget.installEventFilter(self)
         layout.addWidget(self.list_widget)
 
-        lower = QHBoxLayout()
-        self.remove_button = QPushButton("Remove Selected")
-        self.clear_button = QPushButton("Clear")
-        lower.addWidget(self.remove_button)
-        lower.addWidget(self.clear_button)
-        layout.addLayout(lower)
-
-        self.add_button.clicked.connect(self.add_from_edit)
         self.add_edit.returnPressed.connect(self.add_from_edit)
-        self.remove_button.clicked.connect(self.remove_selected)
-        self.clear_button.clicked.connect(self.clear_tags)
+        self.tag_delegate.remove_requested.connect(self._remove_row)
 
     def set_available_tags(self, tags: list[str]) -> None:
         self.available_tags = [normalize_tag_name(tag) for tag in tags]
@@ -670,6 +747,21 @@ class TagSetEditor(QWidget):
             row = self.list_widget.row(item)
             self.list_widget.takeItem(row)
         self.changed.emit()
+
+    def _remove_row(self, row: int) -> None:
+        if 0 <= row < self.list_widget.count():
+            self.list_widget.takeItem(row)
+            self.changed.emit()
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        if (
+            watched is self.list_widget
+            and event.type() == QEvent.KeyPress
+            and event.key() in {Qt.Key_Delete, Qt.Key_Backspace}
+        ):
+            self.remove_selected()
+            return True
+        return super().eventFilter(watched, event)
 
     def clear_tags(self) -> None:
         self.list_widget.clear()
@@ -1149,7 +1241,10 @@ class PositionEditor(QWidget):
     back_requested = Signal()
     deleted = Signal(str)
 
-    def __init__(self, config, parent: QWidget | None = None, recognition_service=None):
+    def __init__(
+        self, config, parent: QWidget | None = None, recognition_service=None,
+        katago_client=None,
+    ):
         super().__init__(parent)
         self.config = config
         self.recognition_service = recognition_service
@@ -1161,6 +1256,7 @@ class PositionEditor(QWidget):
         self.clear_sgf_on_save = False
         self.main_description = ""
         self.main_score = ""
+        self.main_score_visits = 0
         self.main_media_kind = "board"
         self.main_sgf_start_path: list[int] = []
         self.solution_images: list[dict[str, Any]] = []
@@ -1169,6 +1265,13 @@ class PositionEditor(QWidget):
         self.selected_image_index = 0
         self.transient_new_position = False
         self._loading = False
+        self.katago_client = katago_client or KataGoClient(config.katago, self)
+        self._analysis_position_key: tuple[Any, ...] | None = None
+        self._ai_analysis_enabled = False
+        self.analysis_restart_timer = QTimer(self)
+        self.analysis_restart_timer.setSingleShot(True)
+        self.analysis_restart_timer.setInterval(120)
+        self.analysis_restart_timer.timeout.connect(self._restart_ai_analysis)
         self.autosave_timer = QTimer(self)
         self.autosave_timer.setSingleShot(True)
         self.autosave_timer.setInterval(900)
@@ -1327,7 +1430,35 @@ class PositionEditor(QWidget):
         tags_layout = QVBoxLayout(tags_box)
         self.tags_editor = TagSetEditor(self.config)
         tags_layout.addWidget(self.tags_editor)
-        details_layout.addWidget(tags_box, 2)
+        details_layout.addWidget(tags_box, 1)
+
+        self.analysis_box = QGroupBox("AI analysis")
+        self.analysis_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        analysis_layout = QGridLayout(self.analysis_box)
+        analysis_layout.setContentsMargins(10, 10, 10, 8)
+        analysis_layout.setHorizontalSpacing(12)
+        analysis_layout.setVerticalSpacing(2)
+        self.analysis_score_value = QLabel("—")
+        self.analysis_winrate_value = QLabel("—")
+        self.analysis_visits_value = QLabel("—")
+        for column, (caption, value_label) in enumerate((
+            ("Score lead", self.analysis_score_value),
+            ("Win rate", self.analysis_winrate_value),
+            ("Visits", self.analysis_visits_value),
+        )):
+            caption_label = QLabel(caption)
+            caption_label.setStyleSheet("color: #766970; font-size: 10px;")
+            value_label.setStyleSheet(
+                "color: #314f61; font-size: 16px; font-weight: 700;"
+            )
+            value_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            analysis_layout.addWidget(caption_label, 0, column)
+            analysis_layout.addWidget(value_label, 1, column)
+            analysis_layout.setColumnStretch(column, 1)
+        self.analysis_status_label = QLabel("AI is off")
+        self.analysis_status_label.setStyleSheet("color: #766970; font-size: 10px;")
+        analysis_layout.addWidget(self.analysis_status_label, 2, 0, 1, 3)
+        details_layout.addWidget(self.analysis_box)
 
         self.description_edit = QTextEdit()
         self.description_edit.setPlaceholderText("Short text describing the position")
@@ -1340,7 +1471,7 @@ class PositionEditor(QWidget):
         metadata_layout = QVBoxLayout(metadata_box)
         self.metadata_editor = MetadataKeyValueEditor()
         metadata_layout.addWidget(self.metadata_editor)
-        details_layout.addWidget(metadata_box, 2)
+        details_layout.addWidget(metadata_box, 1)
 
         self.details_panel = details
         self.editor_splitter.addWidget(details)
@@ -1362,6 +1493,14 @@ class PositionEditor(QWidget):
         self.metadata_editor.changed.connect(self.schedule_autosave)
         self.image_gallery.sgf_board.start_requested.connect(self.set_selected_sgf_start_path)
         self.image_gallery.sgf_board.sgf_edited.connect(self.set_pending_sgf_text)
+        self.image_gallery.sgf_board.position_changed.connect(
+            self._on_board_position_changed
+        )
+        self.image_gallery.sgf_board.ai_toggled.connect(
+            self.set_ai_analysis_enabled
+        )
+        self._connect_katago_client()
+        QTimer.singleShot(0, self._warm_start_katago)
 
         self.previous_solution_shortcut = QShortcut(
             QKeySequence("Ctrl+Left"), self,
@@ -1383,6 +1522,286 @@ class PositionEditor(QWidget):
         self._update_solution_shortcuts(None, QApplication.focusWidget())
 
         self.setEnabled(False)
+
+    def _connect_katago_client(self) -> None:
+        self.katago_client.analysis_ready.connect(self._show_analysis)
+        self.katago_client.analysis_progress.connect(self._show_analysis)
+        self.katago_client.analysis_failed.connect(self._show_analysis_error)
+        self.katago_client.busy_changed.connect(self._set_analysis_busy)
+        if hasattr(self.katago_client, "engine_ready"):
+            self.katago_client.engine_ready.connect(self._on_katago_ready)
+        if hasattr(self.katago_client, "engine_failed"):
+            self.katago_client.engine_failed.connect(self._on_katago_startup_failed)
+
+    def _warm_start_katago(self) -> None:
+        self._clear_analysis_values()
+        self.analysis_status_label.setStyleSheet("color: #52636e; font-size: 10px;")
+        self.analysis_status_label.setText("Preparing AI engine…")
+        try:
+            self.katago_client.start()
+        except KataGoError as error:
+            self._on_katago_startup_failed(str(error))
+
+    def _on_katago_ready(self, version: str) -> None:
+        if self._ai_analysis_enabled:
+            return
+        self._clear_analysis_values()
+        self.analysis_status_label.setStyleSheet("color: #52636e; font-size: 10px;")
+        self.analysis_status_label.setText(f"AI ready · KataGo {version}")
+
+    def _on_katago_startup_failed(self, message: str) -> None:
+        if self._ai_analysis_enabled:
+            return
+        self._clear_analysis_values()
+        self.analysis_status_label.setStyleSheet("color: #8a3347; font-size: 10px;")
+        self.analysis_status_label.setText(message)
+
+    def _set_analysis_busy(self, busy: bool) -> None:
+        if not busy and not self._ai_analysis_enabled:
+            self.image_gallery.sgf_board.set_ai_enabled(False)
+
+    def set_katago_config(self, config) -> None:
+        self.disable_ai_analysis()
+        self.katago_client.shutdown()
+        self.katago_client.deleteLater()
+        self.config = replace(self.config, katago=config)
+        self.katago_client = KataGoClient(config, self)
+        self._connect_katago_client()
+        self._set_analysis_busy(False)
+        self._warm_start_katago()
+
+    def _current_analysis_key(self) -> tuple[Any, ...] | None:
+        board = self.image_gallery.sgf_board
+        frame = board.current_frame
+        if (
+            frame is None
+            or board.playback is None
+            or self.image_gallery.media_stack.currentWidget() is not board
+        ):
+            return None
+        return (
+            self.current_position_id,
+            self.selected_image_index,
+            frame.node_path,
+            board.playback.board_size,
+            frame.stones,
+            board._current_player_to_move(),
+        )
+
+    @staticmethod
+    def _katago_rules(raw_rules: Any) -> str:
+        value = str(raw_rules or "japanese").strip().lower()
+        for marker, canonical in (
+            ("japanese", "japanese"),
+            ("chinese", "chinese"),
+            ("tromp", "tromp-taylor"),
+            ("new zealand", "new-zealand"),
+            ("new-zealand", "new-zealand"),
+            ("aga", "aga"),
+        ):
+            if marker in value:
+                return canonical
+        return value
+
+    def set_ai_analysis_enabled(self, enabled: bool) -> None:
+        board = self.image_gallery.sgf_board
+        if not enabled:
+            self.disable_ai_analysis("AI analysis stopped")
+            return
+        if self._current_analysis_key() is None:
+            board.set_ai_enabled(False)
+            self._clear_analysis_values()
+            self.analysis_status_label.setText(
+                "Display an SGF board position before enabling AI"
+            )
+            return
+        self._ai_analysis_enabled = True
+        board.set_ai_enabled(True)
+        self.analyze_current_position()
+
+    def analyze_current_position(self) -> None:
+        board = self.image_gallery.sgf_board
+        frame = board.current_frame
+        if (
+            frame is None
+            or board.playback is None
+            or self.image_gallery.media_stack.currentWidget() is not board
+        ):
+            self._show_analysis_error("Display an SGF board position before requesting analysis.")
+            return
+        root = board.playback.root
+        try:
+            komi = float(root.get_property("KM", 6.5))
+        except (TypeError, ValueError):
+            self._show_analysis_error("The SGF komi is invalid; KataGo analysis was not started.")
+            return
+        query = build_analysis_query(
+            frame,
+            board.playback.board_size,
+            board._current_player_to_move(),
+            rules=self._katago_rules(root.get_property("RU", "japanese")),
+            komi=komi,
+            root_policy_temperature=self.config.katago.root_policy_temperature,
+            report_interval_seconds=self.config.katago.report_interval_seconds,
+        )
+        try:
+            self.katago_client.analyze(query)
+        except (KataGoError, KeyError, TypeError, ValueError) as error:
+            self._show_analysis_error(str(error))
+            return
+        self._analysis_position_key = self._current_analysis_key()
+        self._clear_analysis_values()
+        self.analysis_status_label.setStyleSheet("color: #52636e; font-size: 10px;")
+        self.analysis_status_label.setText(
+            f"Starting continuous analysis of node {frame.move_number}…"
+        )
+
+    def _show_analysis(self, result: KataGoAnalysis) -> None:
+        if self._analysis_position_key != self._current_analysis_key():
+            return
+        self.analysis_score_value.setText(
+            self._display_score_lead(result.score_lead)
+        )
+        self.analysis_winrate_value.setText(
+            self._display_winrate(result.winrate)
+        )
+        self.analysis_visits_value.setText(f"{result.visits:,}")
+        self.analysis_status_label.hide()
+        self._store_analysis_score(result)
+        self._show_move_overlays(result)
+
+    @staticmethod
+    def _display_score_lead(score_lead: float | None) -> str:
+        if score_lead is None:
+            return "—"
+        player = "B" if score_lead >= 0 else "W"
+        return f"{player}+{abs(score_lead):.1f}"
+
+    @staticmethod
+    def _display_winrate(black_winrate: float | None) -> str:
+        if black_winrate is None:
+            return "—"
+        if black_winrate >= 0.5:
+            return f"B {black_winrate * 100:.1f}%"
+        return f"W {(1.0 - black_winrate) * 100:.1f}%"
+
+    @staticmethod
+    def _stored_score_lead(score_lead: float) -> str:
+        player = "B" if score_lead >= 0 else "W"
+        return f"{player} +{abs(score_lead):.1f}"
+
+    def _store_analysis_score(self, result: KataGoAnalysis) -> None:
+        board = self.image_gallery.sgf_board
+        frame = board.current_frame
+        if (
+            result.score_lead is None
+            or result.visits < 100
+            or frame is None
+            or tuple(frame.node_path) != tuple(self._selected_sgf_start_path())
+        ):
+            return
+
+        if self.selected_image_index == 0:
+            existing_score = self.main_score.strip()
+            existing_visits = self.main_score_visits
+        elif self.selected_image_index - 1 < len(self.solution_images):
+            selected = self.solution_images[self.selected_image_index - 1]
+            existing_score = str(selected.get("score", "")).strip()
+            existing_visits = int(selected.get("score_visits", 0))
+        else:
+            return
+        if existing_score and result.visits <= existing_visits:
+            return
+
+        score = self._stored_score_lead(result.score_lead)
+        if self.selected_image_index == 0:
+            self.main_score = score
+            self.main_score_visits = result.visits
+        else:
+            selected["score"] = score
+            selected["score_visits"] = result.visits
+
+        self._loading = True
+        try:
+            self.score_edit.setText(score)
+            self._update_score_style()
+        finally:
+            self._loading = False
+        # Continuous reports keep this debounced. It is flushed after analysis
+        # stops, on navigation away, or during clean application shutdown.
+        self.schedule_autosave()
+
+    def _show_move_overlays(self, result: KataGoAnalysis) -> None:
+        board = self.image_gallery.sgf_board
+        if board.playback is None:
+            return
+        width, height = board.playback.board_size
+        sgf_next = board.next_sgf_move_points()
+        overlays: dict[tuple[int, int], BoardMoveOverlay] = {}
+        leading_visits = result.candidates[0].visits if result.candidates else 0
+        for candidate in result.candidates:
+            if (
+                candidate.visits < 10
+                or candidate.visits < leading_visits * 0.01
+            ):
+                continue
+            try:
+                point = Move.from_gtp(candidate.move).coords
+            except (IndexError, ValueError):
+                continue
+            if point is None or not (0 <= point[0] < width and 0 <= point[1] < height):
+                continue
+            if (
+                candidate.order < self.config.katago.overlay_top_moves
+                or candidate.point_loss < self.config.katago.overlay_max_point_loss
+                or point in sgf_next
+            ):
+                overlays[point] = BoardMoveOverlay(
+                    point=point,
+                    point_loss=candidate.point_loss,
+                    is_best=candidate.order == 0,
+                    is_sgf_next=point in sgf_next,
+                    player=result.current_player,
+                )
+        board.set_move_overlays(list(overlays.values()))
+
+    def _show_analysis_error(self, message: str) -> None:
+        self.disable_ai_analysis(message)
+        self.analysis_status_label.setStyleSheet("color: #8a3347; font-size: 10px;")
+
+    def _on_board_position_changed(self) -> None:
+        self.katago_client.cancel()
+        self._analysis_position_key = None
+        self.image_gallery.sgf_board.set_move_overlays(())
+        self._clear_analysis_values()
+        if self._ai_analysis_enabled and self._current_analysis_key() is not None:
+            self.analysis_status_label.setText("Position changed — updating AI analysis…")
+            self.analysis_restart_timer.start()
+
+    def _restart_ai_analysis(self) -> None:
+        if self._ai_analysis_enabled and self._current_analysis_key() is not None:
+            self.analyze_current_position()
+
+    def disable_ai_analysis(self, status: str = "") -> None:
+        self.analysis_restart_timer.stop()
+        self._ai_analysis_enabled = False
+        self.katago_client.cancel()
+        self._analysis_position_key = None
+        self.image_gallery.sgf_board.set_ai_enabled(False)
+        self.image_gallery.sgf_board.set_move_overlays(())
+        self._clear_analysis_values()
+        self.analysis_status_label.setStyleSheet("color: #52636e; font-size: 10px;")
+        self.analysis_status_label.setText(status or "AI is off")
+
+    def _clear_analysis_values(self) -> None:
+        self.analysis_score_value.setText("—")
+        self.analysis_winrate_value.setText("—")
+        self.analysis_visits_value.setText("—")
+        self.analysis_status_label.show()
+
+    def shutdown_analysis(self) -> None:
+        self.disable_ai_analysis()
+        self.katago_client.shutdown()
 
     def _clear_solution_tabs(self) -> None:
         while self.solution_tabs_layout.count():
@@ -1415,6 +1834,28 @@ class PositionEditor(QWidget):
         if self.selected_image_index == 0:
             return list(self.main_sgf_start_path)
         return list(self.solution_images[self.selected_image_index - 1].get("sgf_start_path", []))
+
+    def _reset_selected_score(self) -> None:
+        if self.selected_image_index == 0:
+            self.main_score = ""
+            self.main_score_visits = 0
+        elif self.selected_image_index - 1 < len(self.solution_images):
+            selected = self.solution_images[self.selected_image_index - 1]
+            selected["score"] = ""
+            selected["score_visits"] = 0
+        self._loading = True
+        try:
+            self.score_edit.clear()
+            self._update_score_style()
+        finally:
+            self._loading = False
+
+    def _reset_all_scores(self) -> None:
+        self.main_score = ""
+        self.main_score_visits = 0
+        for solution in self.solution_images:
+            solution["score"] = ""
+            solution["score_visits"] = 0
 
     def _set_selected_media_kind(self, kind: str) -> None:
         if kind not in {"board", "image"}:
@@ -1655,10 +2096,13 @@ class PositionEditor(QWidget):
         self.schedule_autosave()
 
     def set_selected_sgf_start_path(self, path: list[int]) -> None:
+        changed = list(path) != self._selected_sgf_start_path()
         if self.selected_image_index == 0:
             self.main_sgf_start_path = list(path)
         elif self.selected_image_index - 1 < len(self.solution_images):
             self.solution_images[self.selected_image_index - 1]["sgf_start_path"] = list(path)
+        if changed:
+            self._reset_selected_score()
         self.image_gallery.board_start_paths[self.selected_image_index] = list(path)
         self.schedule_autosave()
 
@@ -1797,6 +2241,7 @@ class PositionEditor(QWidget):
         self._update_score_style()
         self._loading = False
         self._rebuild_solution_tabs()
+        self._on_board_position_changed()
 
     def navigate_solution(self, delta: int) -> None:
         item_count = len(self.solution_images) + 1
@@ -1835,8 +2280,10 @@ class PositionEditor(QWidget):
         text = self.score_edit.text().strip()
         if self.selected_image_index == 0:
             self.main_score = text
+            self.main_score_visits = 0
         elif self.selected_image_index - 1 < len(self.solution_images):
             self.solution_images[self.selected_image_index - 1]["score"] = text
+            self.solution_images[self.selected_image_index - 1]["score_visits"] = 0
         self._update_score_style()
         self.schedule_autosave()
 
@@ -1880,6 +2327,7 @@ class PositionEditor(QWidget):
         return super().eventFilter(watched, event)
 
     def clear(self) -> None:
+        self.disable_ai_analysis()
         self.current_position_id = None
         self.pending_image_path = None
         self.pending_image = None
@@ -1891,6 +2339,7 @@ class PositionEditor(QWidget):
         self.solution_images = []
         self.main_description = ""
         self.main_score = ""
+        self.main_score_visits = 0
         self.main_media_kind = "board"
         self.main_sgf_start_path = []
         self.selected_image_index = 0
@@ -1901,10 +2350,13 @@ class PositionEditor(QWidget):
         self.tags_editor.set_tags([])
         self.metadata_editor.set_metadata({})
         self.save_status_label.clear()
+        self._clear_analysis_values()
+        self.analysis_status_label.setText("AI is off")
         self.refresh_gallery(0)
         self.setEnabled(False)
 
     def load_position(self, position_id: str) -> bool:
+        self.disable_ai_analysis()
         self.autosave_timer.stop()
         try:
             record = load_position(self.config, position_id)
@@ -1927,6 +2379,7 @@ class PositionEditor(QWidget):
         self.solution_images = [dict(item) for item in record.get("solution_images", [])]
         self.main_description = record.get("description", "")
         self.main_score = record.get("score", "")
+        self.main_score_visits = record.get("score_visits", 0)
         self.main_media_kind = record.get("main_media_kind", "board")
         self.main_sgf_start_path = list(record.get("sgf_start_path", []))
         self.selected_image_index = 0
@@ -2015,6 +2468,7 @@ class PositionEditor(QWidget):
             self.main_sgf_start_path = []
             for solution in self.solution_images:
                 solution["sgf_start_path"] = []
+            self._reset_all_scores()
             self.refresh_gallery(0)
             self.schedule_autosave()
 
@@ -2036,6 +2490,7 @@ class PositionEditor(QWidget):
         self.main_sgf_start_path = []
         for solution in self.solution_images:
             solution["sgf_start_path"] = []
+        self._reset_all_scores()
         self.refresh_gallery(0)
         self.schedule_autosave()
 
@@ -2045,6 +2500,7 @@ class PositionEditor(QWidget):
         self.pending_sgf_path = None
         self.pending_sgf_text = None
         self.clear_sgf_on_save = True
+        self._reset_all_scores()
         self.refresh_gallery(0)
         self.schedule_autosave()
 
@@ -2075,6 +2531,7 @@ class PositionEditor(QWidget):
                 "file": relative,
                 "description": "",
                 "score": "",
+                "score_visits": 0,
                 "sgf_start_path": current_path,
             })
             self.pending_solution_sources[relative] = path
@@ -2095,6 +2552,7 @@ class PositionEditor(QWidget):
             "file": relative,
             "description": "",
             "score": "",
+            "score_visits": 0,
             "sgf_start_path": current_path,
         })
         self.pending_solution_sources[relative] = image
@@ -2111,6 +2569,7 @@ class PositionEditor(QWidget):
             "file": "",
             "description": "",
             "score": "",
+            "score_visits": 0,
             "sgf_start_path": list(frame.node_path) if frame is not None else [],
         })
         self.refresh_gallery(len(self.solution_images))
@@ -2291,7 +2750,7 @@ class PositionEditor(QWidget):
             tags = minimal_explicit_tags(graph, self.tags_editor.tags())
             self.tags_editor.set_tags(tags)
             main_score = formatted_score(self.main_score) or self.main_score.strip()
-            solution_records: list[dict[str, str]] = []
+            solution_records: list[dict[str, Any]] = []
             for item in self.solution_images:
                 normalized = dict(item)
                 raw_score = normalized.get("score", "").strip()
@@ -2300,6 +2759,7 @@ class PositionEditor(QWidget):
             record = {
                 "description": self.main_description.strip(),
                 "score": main_score,
+                "score_visits": self.main_score_visits,
                 "main_media_kind": self.main_media_kind,
                 "sgf_start_path": list(self.main_sgf_start_path),
                 "tags": tags,
@@ -2859,10 +3319,221 @@ class TagManagerPage(QWidget):
         return self.description_status_label.text() != "Could not save"
 
 
+class KataGoSettingsPage(QWidget):
+    saved = Signal(object)
+    back_requested = Signal()
+
+    def __init__(
+        self,
+        config: KataGoConfig,
+        config_path: Path = DEFAULT_CONFIG_PATH,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.config_path = Path(config_path)
+        self._build_ui()
+        self.set_config(config)
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        header = QHBoxLayout()
+        self.back_btn = QPushButton("Back to browse")
+        title = QLabel("KataGo settings")
+        title.setStyleSheet("font-size: 18px; font-weight: 700;")
+        header.addWidget(self.back_btn)
+        header.addWidget(title)
+        header.addStretch(1)
+        layout.addLayout(header)
+
+        box = QGroupBox("Local KataGo engine")
+        form = QFormLayout(box)
+        self.executable_edit = QLineEdit()
+        self.model_edit = QLineEdit()
+        self.analysis_config_edit = QLineEdit()
+        form.addRow(
+            "KataGo executable",
+            self._path_row(self.executable_edit, self._browse_executable),
+        )
+        form.addRow("Neural-network model", self._path_row(self.model_edit, self._browse_model))
+        form.addRow(
+            "Analysis configuration",
+            self._path_row(self.analysis_config_edit, self._browse_analysis_config),
+        )
+
+        self.startup_timeout_spin = QSpinBox()
+        self.startup_timeout_spin.setRange(1, 3600)
+        self.startup_timeout_spin.setSuffix(" seconds")
+        self.response_timeout_spin = QSpinBox()
+        self.response_timeout_spin.setRange(1, 3600)
+        self.response_timeout_spin.setSuffix(" seconds")
+        self.report_interval_spin = QDoubleSpinBox()
+        self.report_interval_spin.setRange(0.1, 10.0)
+        self.report_interval_spin.setDecimals(1)
+        self.report_interval_spin.setSingleStep(0.1)
+        self.report_interval_spin.setSuffix(" seconds")
+        form.addRow("Startup timeout", self.startup_timeout_spin)
+        form.addRow("Response-silence timeout", self.response_timeout_spin)
+        form.addRow("Live update interval", self.report_interval_spin)
+        help_label = QLabel(
+            "Analysis continues until the displayed position changes or you press Stop. "
+            "These files remain external and are not bundled with the application."
+        )
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet("color: #5f6368;")
+        form.addRow("", help_label)
+        layout.addWidget(box)
+
+        overlay_box = QGroupBox("Board suggestions")
+        overlay_form = QFormLayout(overlay_box)
+        self.overlay_top_moves_spin = QSpinBox()
+        self.overlay_top_moves_spin.setRange(1, 50)
+        self.overlay_point_loss_spin = QDoubleSpinBox()
+        self.overlay_point_loss_spin.setRange(0.0, 100.0)
+        self.overlay_point_loss_spin.setDecimals(1)
+        self.overlay_point_loss_spin.setSingleStep(0.5)
+        self.overlay_point_loss_spin.setSuffix(" points")
+        self.root_policy_temperature_spin = QDoubleSpinBox()
+        self.root_policy_temperature_spin.setRange(0.1, 10.0)
+        self.root_policy_temperature_spin.setDecimals(1)
+        self.root_policy_temperature_spin.setSingleStep(0.1)
+        overlay_form.addRow("Always show top moves", self.overlay_top_moves_spin)
+        overlay_form.addRow(
+            "Also show moves losing less than", self.overlay_point_loss_spin
+        )
+        overlay_form.addRow(
+            "Root policy temperature", self.root_policy_temperature_spin
+        )
+        temperature_help = QLabel(
+            "1.0 is neutral. Higher values spread search across more candidate "
+            "moves; lower values concentrate it more strongly."
+        )
+        temperature_help.setWordWrap(True)
+        temperature_help.setStyleSheet("color: #5f6368;")
+        overlay_form.addRow("", temperature_help)
+        layout.addWidget(overlay_box)
+
+        performance_box = QGroupBox("Performance")
+        performance_form = QFormLayout(performance_box)
+        self.analysis_threads_spin = QSpinBox()
+        self.analysis_threads_spin.setRange(1, 64)
+        self.search_threads_spin = QSpinBox()
+        self.search_threads_spin.setRange(1, 512)
+        self.nn_cache_spin = QSpinBox()
+        self.nn_cache_spin.setRange(10, 30)
+        performance_form.addRow("Simultaneous analysis positions", self.analysis_threads_spin)
+        performance_form.addRow("Search threads per position", self.search_threads_spin)
+        performance_form.addRow("NN cache exponent", self.nn_cache_spin)
+        performance_help = QLabel(
+            "For this single-position interface, 1 analysis position, 16 search "
+            "threads, and cache exponent 20 are conservative starting values. "
+            "Changing these settings restarts KataGo when you save."
+        )
+        performance_help.setWordWrap(True)
+        performance_help.setStyleSheet("color: #5f6368;")
+        performance_form.addRow("", performance_help)
+        layout.addWidget(performance_box)
+
+        actions = QHBoxLayout()
+        self.save_btn = QPushButton("Validate and save")
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        actions.addWidget(self.save_btn)
+        actions.addWidget(self.status_label, 1)
+        layout.addLayout(actions)
+        layout.addStretch(1)
+
+        self.back_btn.clicked.connect(self.back_requested.emit)
+        self.save_btn.clicked.connect(self.save_settings)
+
+    @staticmethod
+    def _path_row(line_edit: QLineEdit, browse_slot) -> QWidget:
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        browse = QPushButton("Browse…")
+        row_layout.addWidget(line_edit, 1)
+        row_layout.addWidget(browse)
+        browse.clicked.connect(browse_slot)
+        return row
+
+    def set_config(self, config: KataGoConfig) -> None:
+        self.executable_edit.setText(str(config.executable or ""))
+        self.model_edit.setText(str(config.model or ""))
+        self.analysis_config_edit.setText(str(config.analysis_config or ""))
+        self.response_timeout_spin.setValue(round(config.timeout_seconds))
+        self.startup_timeout_spin.setValue(round(config.startup_timeout_seconds))
+        self.report_interval_spin.setValue(config.report_interval_seconds)
+        self.overlay_top_moves_spin.setValue(config.overlay_top_moves)
+        self.overlay_point_loss_spin.setValue(config.overlay_max_point_loss)
+        self.root_policy_temperature_spin.setValue(config.root_policy_temperature)
+        self.analysis_threads_spin.setValue(config.num_analysis_threads)
+        self.search_threads_spin.setValue(config.num_search_threads)
+        self.nn_cache_spin.setValue(config.nn_cache_size_power_of_two)
+        self.status_label.clear()
+
+    def _browse_executable(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose KataGo executable", self.executable_edit.text(), "All files (*)"
+        )
+        if path:
+            self.executable_edit.setText(path)
+
+    def _browse_model(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose KataGo model", self.model_edit.text(), "KataGo models (*.bin.gz *.gz);;All files (*)"
+        )
+        if path:
+            self.model_edit.setText(path)
+
+    def _browse_analysis_config(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose KataGo analysis configuration", self.analysis_config_edit.text(), "KataGo configuration (*.cfg);;All files (*)"
+        )
+        if path:
+            self.analysis_config_edit.setText(path)
+
+    def _optional_path(self, text: str) -> Path | None:
+        value = os.path.expandvars(text.strip())
+        if not value:
+            return None
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = self.config_path.parent / path
+        return path.resolve()
+
+    def save_settings(self) -> None:
+        config = KataGoConfig(
+            executable=self._optional_path(self.executable_edit.text()),
+            model=self._optional_path(self.model_edit.text()),
+            analysis_config=self._optional_path(self.analysis_config_edit.text()),
+            timeout_seconds=float(self.response_timeout_spin.value()),
+            startup_timeout_seconds=float(self.startup_timeout_spin.value()),
+            report_interval_seconds=self.report_interval_spin.value(),
+            overlay_top_moves=self.overlay_top_moves_spin.value(),
+            overlay_max_point_loss=self.overlay_point_loss_spin.value(),
+            root_policy_temperature=self.root_policy_temperature_spin.value(),
+            num_analysis_threads=self.analysis_threads_spin.value(),
+            num_search_threads=self.search_threads_spin.value(),
+            nn_cache_size_power_of_two=self.nn_cache_spin.value(),
+        )
+        try:
+            validate_katago_config(config)
+            save_katago_config(config, self.config_path)
+        except (KataGoError, OSError, ValueError, yaml.YAMLError) as error:
+            self.status_label.setStyleSheet("color: #8a3347;")
+            self.status_label.setText(str(error))
+            return
+        self.status_label.setStyleSheet("color: #2f6b48;")
+        self.status_label.setText("Settings validated, saved, and applied.")
+        self.saved.emit(config)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, root: Path | None = None, config_path: Path | None = None):
         super().__init__()
-        self.config = load_config(root=root or DEFAULT_ROOT, config_path=config_path)
+        self.config_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+        self.config = load_config(root=root or DEFAULT_ROOT, config_path=self.config_path)
         self.db = GoPositionDatabase(self.config)
         self.results_dirty = False
         self.maintenance_issues: list[str] = []
@@ -2920,9 +3591,11 @@ class MainWindow(QMainWindow):
         self.browse_nav_btn.setEnabled(False)
         self.new_nav_btn = QPushButton("New entry")
         self.tags_nav_btn = QPushButton("Manage tags")
+        self.katago_nav_btn = QPushButton("KataGo settings")
         nav.addWidget(self.browse_nav_btn)
         nav.addWidget(self.new_nav_btn)
         nav.addWidget(self.tags_nav_btn)
+        nav.addWidget(self.katago_nav_btn)
         nav.addStretch(1)
         root_layout.addLayout(nav)
 
@@ -2978,23 +3651,30 @@ class MainWindow(QMainWindow):
 
         self.editor = PositionEditor(self.config)
         self.tag_manager = TagManagerPage(self.config)
+        self.katago_settings = KataGoSettingsPage(
+            self.config.katago, self.config_path
+        )
         self.statusBar().addPermanentWidget(self.editor.save_status_label)
         self.editor.save_status_label.setEnabled(True)
         self.pages.addWidget(self.search_page)
         self.pages.addWidget(self.editor)
         self.pages.addWidget(self.tag_manager)
+        self.pages.addWidget(self.katago_settings)
         self.pages.setCurrentWidget(self.search_page)
 
         self.search_btn.clicked.connect(self.run_search)
         self.query_edit.returnPressed.connect(self.run_search)
         self.new_nav_btn.clicked.connect(self.create_position)
         self.tags_nav_btn.clicked.connect(self.open_tag_manager)
+        self.katago_nav_btn.clicked.connect(self.open_katago_settings)
         self.editor.back_requested.connect(self.show_search)
         self.editor.saved.connect(self._after_editor_saved)
         self.editor.database_changed.connect(self._after_database_change)
         self.editor.deleted.connect(self._after_deleted_position)
         self.tag_manager.back_requested.connect(self.show_search)
         self.tag_manager.changed.connect(self._after_database_change)
+        self.katago_settings.back_requested.connect(self.show_search)
+        self.katago_settings.saved.connect(self._after_katago_settings_saved)
 
     def _automatic_maintenance(self) -> None:
         issues: list[str] = []
@@ -3127,6 +3807,8 @@ class MainWindow(QMainWindow):
                 return
         elif current_page is self.tag_manager and not self.tag_manager.flush_description_save():
             return
+        if current_page is self.editor:
+            self.editor.disable_ai_analysis()
         self.run_search()
         self.pages.setCurrentWidget(self.search_page)
         self.setWindowTitle(f"Browse — Go Position DB — {self.config.root}")
@@ -3145,6 +3827,7 @@ class MainWindow(QMainWindow):
         elif current_page is self.tag_manager and not self.tag_manager.flush_description_save():
             event.ignore()
             return
+        self.editor.shutdown_analysis()
         event.accept()
 
     def _after_editor_saved(self, position_id: str) -> None:
@@ -3199,6 +3882,16 @@ class MainWindow(QMainWindow):
         self.tag_manager.refresh()
         self.pages.setCurrentWidget(self.tag_manager)
         self.setWindowTitle("Manage tags — Go Position DB")
+
+    def open_katago_settings(self) -> None:
+        self.katago_settings.set_config(self.config.katago)
+        self.pages.setCurrentWidget(self.katago_settings)
+        self.setWindowTitle("KataGo settings — Go Position DB")
+
+    def _after_katago_settings_saved(self, config: KataGoConfig) -> None:
+        self.config = replace(self.config, katago=config)
+        self.db = GoPositionDatabase(self.config)
+        self.editor.set_katago_config(config)
 
     def rebuild_index(self) -> None:
         try:

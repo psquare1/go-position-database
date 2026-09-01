@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from pysgf import GoGame, Move, ParseError
-from PySide6.QtCore import QPointF, QRect, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF, QRegion
 from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QToolButton, QWidget
 
 from .dialogs import SilentMessageBox as QMessageBox
@@ -19,6 +19,7 @@ COORD_ROOM_RATIO = 1.16
 STONE_ROOM_RATIO = 0.46
 BOARD_MARGIN_RATIO = 0.022
 BOARD_MARGIN_MIN = 7.0
+MOVE_LOSS_GRADIENT_MAX = 5.0
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,15 @@ class SgfFrame:
     circles: tuple[tuple[int, int], ...] = ()
     squares: tuple[tuple[int, int], ...] = ()
     crosses: tuple[tuple[int, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class BoardMoveOverlay:
+    point: tuple[int, int]
+    point_loss: float | None
+    is_best: bool = False
+    is_sgf_next: bool = False
+    player: str | None = None
 
 
 @dataclass(frozen=True)
@@ -589,17 +599,85 @@ def _draw_markup(
     painter.setOpacity(original_opacity)
 
 
-def _annotation_color(
-    point: tuple[int, int],
-    stone_players: dict[tuple[int, int], str],
-) -> QColor:
-    """Return the shared high-contrast blue used for every board annotation."""
-    player = stone_players.get(point)
+def _draw_move_overlays(
+    painter: QPainter,
+    left: float,
+    bottom: float,
+    step: float,
+    overlays: tuple[BoardMoveOverlay, ...],
+) -> None:
+    # Match the stones exactly so suggestions read as possible next moves rather
+    # than as smaller annotations floating above the grid.
+    radius = step * STONE_ROOM_RATIO
+    for overlay in overlays:
+        center = _point(left, bottom, step, *overlay.point)
+        color = _move_overlay_fill_color(overlay)
+        foreground = _move_overlay_foreground_color(overlay.player)
+        painter.setPen(QPen(foreground, max(1.0, step * 0.055)))
+        painter.setBrush(color)
+        painter.drawEllipse(center, radius, radius)
+
+        if overlay.point_loss is None:
+            label = "SGF"
+        elif overlay.point_loss < 9.95:
+            label = f"{overlay.point_loss:.1f}"
+        else:
+            label = f"{overlay.point_loss:.0f}"
+        font = painter.font()
+        font.setBold(True)
+        font.setPixelSize(max(8, round(step * (0.30 if len(label) > 3 else 0.36))))
+        painter.setFont(font)
+        painter.setPen(foreground)
+        painter.drawText(
+            QRectF(
+                center.x() - radius,
+                center.y() - radius,
+                radius * 2,
+                radius * 2,
+            ),
+            Qt.AlignCenter,
+            label,
+        )
+
+
+def _move_overlay_foreground_color(player: str | None) -> QColor:
+    # The foreground echoes the suggested stone color. The corresponding fill
+    # palettes below are deliberately light for Black and dark for White.
+    return QColor("#171819") if player == "B" else QColor("#fffdf8")
+
+
+def _move_overlay_fill_color(overlay: BoardMoveOverlay) -> QColor:
+    if overlay.is_best:
+        color = _annotation_color_for_player(overlay.player)
+    else:
+        loss = max(0.0, overlay.point_loss or 0.0)
+        ratio = min(1.0, loss / MOVE_LOSS_GRADIENT_MAX)
+        # Hue travels from green through amber to red. Keep Black-to-play fills
+        # light enough for black lettering and White-to-play fills dark enough
+        # for white lettering, while retaining the app's muted blue/pink feel.
+        if overlay.player == "B":
+            saturation, value = 0.46, 0.90
+        else:
+            saturation, value = 0.62, 0.66
+        color = QColor.fromHsvF((1.0 - ratio) / 3.0, saturation, value)
+    color.setAlpha(232)
+    return color
+
+
+def _annotation_color_for_player(player: str | None) -> QColor:
     if player == "B":
         return QColor("#b9e5ff")
     if player == "W":
         return QColor("#176a9f")
     return QColor("#318fc8")
+
+
+def _annotation_color(
+    point: tuple[int, int],
+    stone_players: dict[tuple[int, int], str],
+) -> QColor:
+    """Return the shared high-contrast blue used for every board annotation."""
+    return _annotation_color_for_player(stone_players.get(point))
 
 
 def _last_move_marker_visible(
@@ -623,6 +701,7 @@ def paint_sgf_board(
     preview_point: tuple[int, int] | None = None,
     preview_tool: str | None = None,
     preview_player: str | None = None,
+    move_overlays: tuple[BoardMoveOverlay, ...] = (),
 ) -> None:
     """Paint the wood, grid, coordinates, stones, and markup for ``frame``.
 
@@ -774,6 +853,9 @@ def paint_sgf_board(
         painter, left, bottom, step, radius, stone_players, shapes, labels,
         applied_preview_point, annotation_preview,
     )
+    # Engine suggestions intentionally sit above SGF annotations. They remain a
+    # transient display layer and never mutate the SGF tree.
+    _draw_move_overlays(painter, left, bottom, step, move_overlays)
 
 
 def render_sgf_board(
@@ -893,6 +975,8 @@ class ReadOnlySgfBoard(QWidget):
     """A native Qt board with tree navigation and editable SGF markup."""
 
     frame_changed = Signal(int, int)
+    position_changed = Signal()
+    ai_toggled = Signal(bool)
     start_requested = Signal(object)
     sgf_edited = Signal(str)
     CONTROL_PANEL_HEIGHT = 36
@@ -908,6 +992,9 @@ class ReadOnlySgfBoard(QWidget):
         self.annotation_tool: str | None = None
         self.edit_tool = "play"
         self.hovered_point: tuple[int, int] | None = None
+        self.move_overlays: tuple[BoardMoveOverlay, ...] = ()
+        self._board_base_cache = QPixmap()
+        self._board_base_cache_key: tuple[Any, ...] | None = None
         self.setMinimumSize(300, 420)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -944,6 +1031,9 @@ class ReadOnlySgfBoard(QWidget):
         self.variation_previous_button.setText("V ↑")
         self.variation_next_button = QToolButton()
         self.variation_next_button.setText("V ↓")
+        self.ai_button = QToolButton()
+        self.ai_button.setText("AI")
+        self.ai_button.setCheckable(True)
 
         self.edit_mode_buttons: dict[str, QToolButton] = {}
         for key, button in (
@@ -989,6 +1079,7 @@ class ReadOnlySgfBoard(QWidget):
         grouped_buttons = (
             (position_buttons, "#fffafa"),
             (variation_buttons, "#f4f7fa"),
+            ([self.ai_button], "#e9f3f8"),
             (navigation_buttons, "#fffdfd"),
             (annotation_buttons, "#fbf0f4"),
             ([self.delete_node_button], "#fbf3f3"),
@@ -1026,7 +1117,8 @@ class ReadOnlySgfBoard(QWidget):
 
         for button in (
             *navigation_buttons, *variation_buttons, *position_buttons,
-            *annotation_buttons, self.delete_node_button, self.refresh_button,
+            *annotation_buttons, self.ai_button, self.delete_node_button,
+            self.refresh_button,
         ):
             button.setToolTip("")
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -1046,6 +1138,7 @@ class ReadOnlySgfBoard(QWidget):
         controls_layout.addWidget(self.pass_button)
         controls_layout.addWidget(self.variation_previous_button)
         controls_layout.addWidget(self.variation_next_button)
+        controls_layout.addWidget(self.ai_button)
         controls_layout.addWidget(self.first_button)
         controls_layout.addWidget(self.back_ten_button)
         controls_layout.addWidget(self.previous_button)
@@ -1067,12 +1160,16 @@ class ReadOnlySgfBoard(QWidget):
         self.last_button.clicked.connect(self.go_to_last)
         self.variation_previous_button.clicked.connect(lambda: self.change_variation(-1))
         self.variation_next_button.clicked.connect(lambda: self.change_variation(1))
+        self.ai_button.clicked.connect(
+            lambda: self.ai_toggled.emit(self.ai_button.isChecked())
+        )
         self.delete_node_button.clicked.connect(self.delete_current_node)
         self.refresh_button.clicked.connect(self.refresh_start)
         self._update_controls()
         self._position_controls()
 
     def load_file(self, path: Path, start_path: list[int] | tuple[int, ...] = ()) -> bool:
+        self.set_move_overlays(())
         try:
             self.saved_start_path = tuple(start_path)
             self.playback = load_sgf_playback(path, start_path)
@@ -1086,9 +1183,11 @@ class ReadOnlySgfBoard(QWidget):
             self.active_line_paths = []
         self._update_controls()
         self.update()
+        self.position_changed.emit()
         return self.playback is not None
 
     def load_text(self, text: str, start_path: list[int] | tuple[int, ...] = ()) -> bool:
+        self.set_move_overlays(())
         try:
             self.saved_start_path = tuple(start_path)
             self.playback = load_sgf_text(text, start_path)
@@ -1102,9 +1201,12 @@ class ReadOnlySgfBoard(QWidget):
             self.active_line_paths = []
         self._update_controls()
         self.update()
+        self.position_changed.emit()
         return self.playback is not None
 
     def clear(self) -> None:
+        self.set_ai_enabled(False)
+        self.set_move_overlays(())
         self.playback = None
         self.error_message = ""
         self.saved_start_path = ()
@@ -1113,6 +1215,7 @@ class ReadOnlySgfBoard(QWidget):
         self._activate_board_tool("play")
         self._update_controls()
         self.update()
+        self.position_changed.emit()
 
     def _select_annotation_tool(self, tool: str | None, checked: bool) -> None:
         self._activate_board_tool(tool if tool is not None and checked else "play")
@@ -1265,6 +1368,7 @@ class ReadOnlySgfBoard(QWidget):
         self._update_controls()
         self.update()
         self.sgf_edited.emit(serialized)
+        self.position_changed.emit()
         if self.active_line_paths:
             self.frame_changed.emit(self.frame_index, len(self.active_line_paths))
 
@@ -1405,6 +1509,65 @@ class ReadOnlySgfBoard(QWidget):
             return self.playback.frames_by_path[self.active_line_paths[self.frame_index]]
         return None
 
+    def set_ai_enabled(self, enabled: bool) -> None:
+        self.ai_button.setChecked(bool(enabled))
+
+    def set_move_overlays(
+        self, overlays: tuple[BoardMoveOverlay, ...] | list[BoardMoveOverlay]
+    ) -> None:
+        updated = tuple(overlays)
+        if updated == self.move_overlays:
+            return
+        dirty_region = self._move_overlay_region((*self.move_overlays, *updated))
+        self.move_overlays = updated
+        if dirty_region.isEmpty():
+            self.update()
+        else:
+            self.update(dirty_region)
+
+    def _move_overlay_region(
+        self, overlays: tuple[BoardMoveOverlay, ...] | list[BoardMoveOverlay]
+    ) -> QRegion:
+        geometry = self._board_geometry()
+        if geometry is None:
+            return QRegion()
+        _board_rect, left, _right, _top, bottom, step = geometry
+        # Include the circle outline and antialiasing fringe. Both the previous
+        # and replacement locations are invalidated so removed circles restore
+        # the board underneath them.
+        radius = step * STONE_ROOM_RATIO + max(3.0, step * 0.06)
+        region = QRegion()
+        for overlay in overlays:
+            center = _point(left, bottom, step, *overlay.point)
+            rect = QRectF(
+                center.x() - radius,
+                center.y() - radius,
+                radius * 2,
+                radius * 2,
+            ).toAlignedRect()
+            region = region.united(QRegion(rect))
+        return region
+
+    def next_sgf_move_points(self) -> set[tuple[int, int]]:
+        if not self.playback or not self.current_frame:
+            return set()
+        node = self._node_at_path(self.current_frame.node_path)
+        if node is None:
+            return set()
+        points: set[tuple[int, int]] = set()
+        for child in node.ordered_children:
+            for player in ("B", "W"):
+                for value in child.get_list_property(player, []):
+                    try:
+                        point = Move.from_sgf(
+                            value, board_size=self.playback.board_size
+                        ).coords
+                    except (IndexError, ValueError):
+                        continue
+                    if point is not None:
+                        points.add(point)
+        return points
+
     def _select_path(self, path: tuple[int, ...]) -> None:
         if not self.playback:
             return
@@ -1429,6 +1592,7 @@ class ReadOnlySgfBoard(QWidget):
         self.update()
         if self.active_line_paths:
             self.frame_changed.emit(self.frame_index, len(self.active_line_paths))
+        self.position_changed.emit()
 
     def _variation_context(self) -> tuple[tuple[int, ...], int, int] | None:
         """Return the nearest branch parent, selected child index, and child count."""
@@ -1460,6 +1624,7 @@ class ReadOnlySgfBoard(QWidget):
         self._update_controls()
         self.update()
         self.frame_changed.emit(self.frame_index, len(self.active_line_paths))
+        self.position_changed.emit()
 
     def set_frame(self, index: int) -> None:
         if not self.playback or not self.active_line_paths:
@@ -1468,6 +1633,7 @@ class ReadOnlySgfBoard(QWidget):
         self._update_controls()
         self.update()
         self.frame_changed.emit(self.frame_index, len(self.active_line_paths))
+        self.position_changed.emit()
 
     def request_current_start(self) -> None:
         frame = self.current_frame
@@ -1491,6 +1657,7 @@ class ReadOnlySgfBoard(QWidget):
         for button in (*self.edit_mode_buttons.values(), *self.annotation_buttons.values()):
             button.setEnabled(frame is not None)
         self.pass_button.setEnabled(frame is not None)
+        self.ai_button.setEnabled(frame is not None)
         variation = self._variation_context()
         has_variation = variation is not None
         self.variation_previous_button.setEnabled(has_variation)
@@ -1608,8 +1775,44 @@ class ReadOnlySgfBoard(QWidget):
         super().mousePressEvent(event)
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
+        cache_key = (
+            self.width(),
+            self.height(),
+            self.devicePixelRatioF(),
+            id(self.playback),
+            self.current_frame,
+            self.error_message,
+            self.hovered_point,
+            self.edit_tool,
+        )
+        if self._board_base_cache.isNull() or cache_key != self._board_base_cache_key:
+            pixel_ratio = self.devicePixelRatioF()
+            pixel_size = QSize(
+                max(1, round(self.width() * pixel_ratio)),
+                max(1, round(self.height() * pixel_ratio)),
+            )
+            cache = QPixmap(pixel_size)
+            cache.setDevicePixelRatio(pixel_ratio)
+            cache.fill(QColor("#f6f2f1"))
+            cache_painter = QPainter(cache)
+            cache_painter.setRenderHint(QPainter.Antialiasing)
+            self._paint_board_base(cache_painter)
+            cache_painter.end()
+            self._board_base_cache = cache
+            self._board_base_cache_key = cache_key
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        painter.setClipRegion(event.region())
+        painter.drawPixmap(0, 0, self._board_base_cache)
+        geometry = self._board_geometry()
+        if geometry is not None and self.current_frame is not None:
+            _board_rect, left, _right, _top, bottom, step = geometry
+            _draw_move_overlays(
+                painter, left, bottom, step, self.move_overlays
+            )
+
+    def _paint_board_base(self, painter: QPainter) -> None:
         painter.fillRect(self.rect(), QColor("#f6f2f1"))
         outer_rect, media_board_rect, _ = self._content_rects()
         painter.setPen(QPen(QColor("#cfc5c8"), 1))

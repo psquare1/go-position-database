@@ -95,6 +95,10 @@ Each entry can have any number of variations. Each variation is associated with
 its own image or a node in the entry's shared SGF tree.
 
 The primary position and every variation can have its own description and score.
+KataGo analysis of an item's configured starting node may refresh that score once
+it reaches 100 visits. The accompanying `score_visits` value ensures that a saved
+estimate is replaced only by a more deeply searched estimate; choosing a new
+starting node clears both values.
 
 ### Work with SGFs
 
@@ -175,7 +179,9 @@ The on-disk names `positions`, `position.*`, `solutions`, and `solution_images`
 are retained for compatibility with existing collections. In the app and this
 guide they correspond to entries, primary positions, and variations.
 
-The collection paths and canonical filenames can be changed in `config.yaml`:
+Application settings live in `config.yaml` beside the application code. The
+selected collection root remains controlled by `--root`; collection paths below
+are resolved from that root:
 
 ```yaml
 positions_directory: positions
@@ -186,7 +192,51 @@ files:
   sgf: position.sgf
   image: position.png
   metadata: metadata.yaml
+
+katago:
+  executable: C:/tools/katago/katago.exe
+  model: C:/tools/katago/model.bin.gz
+  analysis_config: C:/tools/katago/analysis.cfg
+  timeout_seconds: 60
+  startup_timeout_seconds: 180
+  report_interval_seconds: 0.1
+  overlay_top_moves: 5
+  overlay_max_point_loss: 2.0
+  root_policy_temperature: 1.0
+  num_analysis_threads: 1
+  num_search_threads: 16
+  nn_cache_size_power_of_two: 20
 ```
+
+The KataGo section is optional. On macOS and Linux, use the corresponding local
+executable path. KataGo paths are resolved relative to the application config;
+environment variables and `~` are expanded. The application does not bundle or
+download KataGo, a neural-network model, or an analysis configuration. Startup
+and analysis have separate timeouts because loading and compiling a large model
+can take substantially longer than analyzing a position once the engine is ready.
+The settings can also be validated and edited from **KataGo settings** in the
+application. The analysis timeout is a stalled-response watchdog, not a visit or
+search-duration limit.
+
+When configured, the **AI** toggle in the native board controls sends the SGF node
+currently visible on the board to a managed background analysis process. KataGo
+is started in the background when the application opens so its executable and
+model are already warm before the first analysis request. It then keeps searching
+and reports progressively stronger snapshots at the configured
+interval, which defaults to 0.1 seconds (10 requested reports per second).
+Navigating within the SGF replaces the obsolete request and continues analysis;
+turning AI off or leaving the entry stops it. The board shows the configured top
+moves, moves below the configured point-loss threshold, and immediate SGF
+continuations. Every displayed move must have at least 10 visits and at least 1%
+as many visits as the leading candidate. Root policy temperature controls how
+broadly KataGo distributes its search; 1.0 is neutral and higher values explore
+more alternatives. Results and ownership data are transient: they are not
+written to the entry record or SGF.
+
+The thread and NN-cache settings are passed to KataGo as launch overrides, so the
+shared external `analysis.cfg` does not need to be rewritten. The defaults favor
+one interactive position and substantially less memory than KataGo's large batch
+analysis example configuration.
 
 The repository ignores its default collection files, so a fresh clone starts
 empty. To version a personal collection, the safest arrangement is a separate
@@ -217,9 +267,9 @@ python go_db.py --root . init --force
 python go_db.py --root . gui
 ```
 
-`init` creates the collection folders and starter configuration. `init --force`
-overwrites the starter configuration and tag files, but does not erase entry
-folders.
+`init` creates the collection folders and starter tag file. It does not put
+machine-specific application configuration in the collection. `init --force`
+overwrites the starter tag file, but does not erase entry folders.
 
 ### Search and inspect
 
@@ -326,6 +376,6 @@ Possible future directions include:
 
 - a preset vocabulary of common Go tags;
 - publishing, sharing, or merging collections; and
-- integration with KataGo analysis.
+- KataGo candidate-move and ownership overlays on the native board.
 
 Pull requests are welcome.
